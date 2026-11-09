@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use umicraft_mesh::{mesh_chunk, BlockSource, ChunkSnapshot, Mesh, Vertex, VertexLight};
+use umicraft_mesh::{
+    mesh_chunk, mesh_chunk_lit, BlockSource, ChunkSnapshot, Lighting, Mesh, Vertex, VertexLight,
+};
 use umicraft_world::{BlockState, ChunkColumn, ChunkPos, LightLevel};
 
 /// A synthetic scene with explicit blocks and light; anything unspecified is
@@ -192,33 +194,40 @@ fn transparent_states_use_the_second_pass() {
         ([0, 0, 0], BlockState::new(1, 0)),   // stone: opaque
         ([4, 0, 0], BlockState::new(9, 0)),   // water: liquid
         ([8, 0, 0], BlockState::new(20, 0)),  // glass: transparent
-        ([12, 0, 0], BlockState::new(18, 0)), // leaves: transparent
+        ([12, 0, 0], BlockState::new(18, 0)), // leaves: cutout, opaque pass
     ]);
     let mesh = mesh_chunk(ChunkPos::new(0, 0), &scene);
 
-    assert_eq!(mesh.opaque_face_count(), 6);
-    assert_eq!(mesh.transparent_face_count(), 18);
-    assert_eq!(mesh.face_count(), 24, "the counts cover both passes");
-    assert_eq!(mesh.triangle_count(), 48);
-    assert_eq!(mesh.vertices.len(), 24);
-    assert_eq!(mesh.indices.len(), 36);
-    assert_eq!(mesh.transparent_vertices.len(), 72);
-    assert_eq!(mesh.transparent_indices.len(), 108);
+    // Glass and leaves are six faces each; a lone water block is eleven:
+    // the surface and its underside, the bottom, and four sides drawn from
+    // both sides (MCP `BlockFluidRenderer.renderFluid`). The leaves are
+    // `CUTOUT_MIPPED`, so they join the stone in the opaque pass.
+    assert_eq!(mesh.opaque_face_count(), 12);
+    assert_eq!(mesh.transparent_face_count(), 17);
+    assert_eq!(mesh.face_count(), 29, "the counts cover both passes");
+    assert_eq!(mesh.triangle_count(), 58);
+    assert_eq!(mesh.vertices.len(), 48);
+    assert_eq!(mesh.indices.len(), 72);
+    assert_eq!(mesh.transparent_vertices.len(), 68);
+    assert_eq!(mesh.transparent_indices.len(), 102);
 
     // The two index streams are independent: each starts at zero and every
     // index stays inside its own vertex buffer.
     let mut opaque = mesh.indices.clone();
     opaque.sort_unstable();
     opaque.dedup();
-    assert_eq!(opaque, (0..24).collect::<Vec<u32>>());
+    assert_eq!(opaque, (0..48).collect::<Vec<u32>>());
     let mut transparent = mesh.transparent_indices.clone();
     transparent.sort_unstable();
     transparent.dedup();
-    assert_eq!(transparent, (0..72).collect::<Vec<u32>>());
+    assert_eq!(transparent, (0..68).collect::<Vec<u32>>());
 
     // The stone uses the procedural stone layer (3), the fluids and the
-    // see-through cubes their own layers; none leaked into the opaque pass.
-    assert!(mesh.vertices.iter().all(|vertex| vertex.layer == 3));
+    // see-through cubes their own layers; only the stone and the leaves (the
+    // last 24 vertices) are in the opaque pass.
+    let (stone, leaves) = mesh.vertices.split_at(24);
+    assert!(stone.iter().all(|vertex| vertex.layer == 3));
+    assert!(leaves.iter().all(|vertex| vertex.layer != 3));
 }
 
 #[test]
@@ -256,4 +265,136 @@ fn the_no_light_fallback_keeps_the_legacy_geometry() {
         let light = VertexLight::unpack(vertex.light);
         light.block == 0 && light.sky == 15 && light.ao == 15 && light.shade
     }));
+}
+
+/// The up face of a block beside a taller block: smooth lighting darkens the
+/// corner next to the wall, flat lighting gives the four corners one value.
+fn up_face_corner_lights(lighting: Lighting) -> Vec<VertexLight> {
+    let stone = BlockState::new(1, 0);
+    let scene = Scene::new(&[([0, 0, 0], stone), ([1, 1, 0], stone)])
+        .with_lights(
+            &[[0, 1, 0], [-1, 1, 0], [0, 1, 1], [-1, 1, 1], [0, 1, -1]],
+            LightLevel::new(0, 15),
+        )
+        .with_light([1, 1, 1], LightLevel::new(0, 5));
+    let mesh = mesh_chunk_lit(ChunkPos::new(0, 0), &scene, lighting);
+    [
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.0, 1.0, 1.0],
+    ]
+    .iter()
+    .map(|corner| vertex_light(&mesh, *corner, [0.0, 1.0, 0.0]))
+    .collect()
+}
+
+#[test]
+fn flat_lighting_gives_every_corner_of_a_face_the_same_light() {
+    let flat = up_face_corner_lights(Lighting::Flat);
+    assert!(flat.iter().all(|light| *light == flat[0]), "{flat:?}");
+    assert_eq!(flat[0].sky, 15, "the cell outside the face is sampled");
+    assert_eq!(flat[0].ao, VertexLight::AO_OPEN);
+}
+
+#[test]
+fn smooth_lighting_varies_across_the_face_next_to_a_wall() {
+    let smooth = up_face_corner_lights(Lighting::Smooth);
+    assert!(smooth.iter().any(|light| *light != smooth[0]), "{smooth:?}");
+    assert_eq!(
+        mesh_chunk(
+            ChunkPos::new(0, 0),
+            &Blocks(vec![([0, 0, 0], BlockState::new(1, 0))])
+        ),
+        mesh_chunk_lit(
+            ChunkPos::new(0, 0),
+            &Blocks(vec![([0, 0, 0], BlockState::new(1, 0))]),
+            Lighting::Smooth
+        ),
+        "mesh_chunk is the smooth mesh"
+    );
+}
+
+#[test]
+fn the_option_values_one_and_two_mesh_alike() {
+    // 1.8.8 only tests ambientOcclusion != 0 (Minecraft.isAmbientOcclusionEnabled).
+    assert_eq!(Lighting::from_option(0), Lighting::Flat);
+    assert_eq!(Lighting::from_option(1), Lighting::Smooth);
+    assert_eq!(Lighting::from_option(2), Lighting::Smooth);
+}
+
+// `Block.getMixedBrightnessForBlock` and `World.getCombinedLight`.
+
+const STONE: u16 = 1;
+const SLAB: u16 = 44;
+const LEAVES: u16 = 18;
+const GLASS: u16 = 20;
+const TORCH: u16 = 50;
+const WATER: u16 = 9;
+
+#[test]
+fn a_slab_cell_is_lit_by_the_cells_above_and_beside_it() {
+    // The engine stores a slab's own cell as dark: it stops light.
+    let scene = Scene::new(&[([0, 0, 0], BlockState::new(SLAB, 0))])
+        .with_light([0, 1, 0], LightLevel::new(3, 12))
+        .with_light([1, 0, 0], LightLevel::new(5, 9));
+    assert_eq!(scene.mixed_light(0, 0, 0), LightLevel::new(5, 12));
+}
+
+#[test]
+fn a_slab_in_the_dark_takes_the_cell_below_it() {
+    let scene = Scene::new(&[
+        ([0, 0, 0], BlockState::new(SLAB, 0)),
+        ([0, -1, 0], BlockState::new(STONE, 0)),
+    ])
+    .with_light([0, -1, 0], LightLevel::new(0, 7));
+    assert_eq!(scene.mixed_light(0, 0, 0), LightLevel::new(0, 7));
+}
+
+#[test]
+fn a_solid_cube_keeps_its_own_light() {
+    let scene = Scene::new(&[([0, 0, 0], BlockState::new(STONE, 0))])
+        .with_light([0, 0, 0], LightLevel::new(2, 4))
+        .with_light([0, 1, 0], LightLevel::new(15, 15));
+    assert_eq!(scene.mixed_light(0, 0, 0), LightLevel::new(2, 4));
+}
+
+#[test]
+fn blocks_that_let_light_through_take_their_neighbours_but_leaves_water_do_not() {
+    for (id, own, expected) in [
+        (GLASS, LightLevel::new(0, 5), LightLevel::new(0, 9)),
+        (LEAVES, LightLevel::new(0, 5), LightLevel::new(0, 5)),
+        (WATER, LightLevel::new(0, 5), LightLevel::new(0, 5)),
+    ] {
+        let scene = Scene::new(&[([0, 0, 0], BlockState::new(id, 0))])
+            .with_light([0, 0, 0], own)
+            .with_light([0, 1, 0], LightLevel::new(0, 9));
+        assert_eq!(scene.mixed_light(0, 0, 0), expected, "block {id}");
+    }
+}
+
+#[test]
+fn a_torch_keeps_its_emission_over_dimmer_neighbours() {
+    let scene = Scene::new(&[([0, 0, 0], BlockState::new(TORCH, 5))])
+        .with_light([1, 0, 0], LightLevel::new(13, 0));
+    assert_eq!(scene.mixed_light(0, 0, 0), LightLevel::new(14, 0));
+}
+
+#[test]
+fn a_wall_face_beside_a_slab_is_lit_like_its_surroundings() {
+    // A stone block with a slab against its east face: the face's outward
+    // cell is the slab's, which the engine stores as dark.
+    let scene = Scene::new(&[
+        ([0, 0, 0], BlockState::new(STONE, 0)),
+        ([1, 0, 0], BlockState::new(SLAB, 0)),
+    ])
+    .with_lights(
+        &[[1, 1, 0], [1, 0, 1], [1, 0, -1], [1, 1, 1], [1, 1, -1]],
+        LightLevel::new(0, 14),
+    );
+    let mesh = mesh_chunk(ChunkPos::new(0, 0), &scene);
+    let light = vertex_light(&mesh, [1.0, 1.0, 1.0], [1.0, 0.0, 0.0]);
+    // The four cells around the corner are all 14; the dark slab cell used to
+    // drag the average down to 11.
+    assert_eq!(light.sky, 14, "the east face is lit like its surroundings");
 }

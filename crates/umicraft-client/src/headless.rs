@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use crate::args::Args;
 use crate::error::ClientError;
 use crate::game::{GameEvent, GameStatus, RenderEvent, Session, TICK};
-use crate::input::{default_script, idle_script, Script, ScriptPhase};
+use crate::input::{
+    combat_script, default_script, idle_script, movement_script, Script, ScriptPhase,
+};
 use crate::network::NetworkConfig;
 
 /// The summary of a headless session.
@@ -64,7 +66,15 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
         host: host.to_string(),
         port,
         name: args.name.clone(),
+        session: args.session.clone(),
         view_distance: args.view_distance,
+        chat_mode: 0,
+        chat_colors: true,
+        skin_parts: crate::options::SkinOptions::default().parts_mask(),
+        handshake_host: args.handshake_host.clone(),
+        // No window can ask the player, so no pack is installed.
+        decline_server_packs: true,
+        account_skin: false,
     })?;
 
     let mut script = Script::new(phases(&args.script));
@@ -86,9 +96,9 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
                 RenderEvent::Frame(frame) => {
                     report.ticks = report.status.ticks.max(1);
                     report.position = (
-                        f64::from(frame.state.position.x),
-                        f64::from(frame.state.position.y),
-                        f64::from(frame.state.position.z),
+                        frame.state.position.x,
+                        frame.state.position.y,
+                        frame.state.position.z,
                     );
                     // The chat line goes out once the player is placed.
                     if let (Some(message), false) = (args.chat.as_ref(), chat_sent) {
@@ -97,8 +107,8 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
                     }
                 }
                 RenderEvent::Hud(hud) => {
-                    if !hud.chat_lines.is_empty() {
-                        report.chat = hud.chat_lines.clone();
+                    if !hud.chat.is_empty() {
+                        report.chat = hud.chat.iter().map(|line| line.plain()).collect();
                     }
                     report.health = hud.health;
                     report.food = hud.food;
@@ -114,10 +124,18 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
                     report.breaks_acknowledged = report.status.breaks_acknowledged;
                     report.placements_acknowledged = report.status.placements_acknowledged;
                 }
-                RenderEvent::Ended(reason) => {
-                    report.error = Some(reason);
+                RenderEvent::Ended(end) => {
+                    report.error = Some(end.to_string());
                 }
-                RenderEvent::Reset => {}
+                RenderEvent::Inventory(_)
+                | RenderEvent::Creative(_)
+                | RenderEvent::TextScreen(_)
+                | RenderEvent::ServerPack(_)
+                | RenderEvent::Sounds(_)
+                | RenderEvent::LookSlot(_)
+                | RenderEvent::Stats(_)
+                | RenderEvent::Connect(_)
+                | RenderEvent::Reset => {}
             }
             if report.error.is_some() {
                 break;
@@ -178,6 +196,8 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
 fn phases(name: &str) -> Vec<ScriptPhase> {
     match name {
         "idle" => idle_script(),
+        "movement" => movement_script(),
+        "combat" => combat_script(),
         _ => default_script(),
     }
 }
@@ -191,5 +211,7 @@ mod tests {
         assert!(!phases("default").is_empty());
         assert_eq!(phases("idle").len(), 1);
         assert_eq!(phases("idle")[0].step, crate::input::ScriptStep::Idle);
+        assert_eq!(phases("movement").len(), movement_script().len());
+        assert_eq!(phases("combat").len(), combat_script().len());
     }
 }

@@ -32,16 +32,22 @@
 
 pub mod block;
 pub mod chunk;
+mod chunk_map;
 pub mod error;
+pub mod fluid;
 pub mod light;
 pub mod pos;
+mod precipitation;
+mod relight;
 pub mod section;
 pub mod world;
 
 pub use block::{BlockKind, BlockState};
 pub use chunk::{ChunkColumn, ChunkPayload, SECTION_COUNT, WORLD_HEIGHT};
+pub use chunk_map::{ChunkHasher, ChunkMap, ChunkSet};
 pub use error::WorldError;
 pub use light::LightLevel;
 pub use pos::{BlockPos, ChunkPos};
+pub use relight::{is_slab, light_emission, uses_neighbor_brightness};
 pub use section::Section;
 pub use world::World;

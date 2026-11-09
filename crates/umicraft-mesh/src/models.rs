@@ -33,12 +33,16 @@
 use std::sync::Arc;
 
 use umicraft_model::{AtlasLayout, BlockModel, BlockModelSet, ModelVariant};
-use umicraft_world::{BlockState, ChunkPos};
+use umicraft_world::fluid::Liquid;
+use umicraft_world::{light_emission, BlockState, ChunkPos};
 
-use crate::{
-    emit_legacy_faces_with, is_transparent_pass, occludes, quad_light, tint, BlockSource, Face,
-    Mesh, Vertex,
-};
+use crate::fluid::{self, FluidLayers};
+
+use crate::actual_state;
+use crate::legacy::{emit_legacy_faces_with, is_transparent_pass, mesh_sections, occludes};
+use crate::lighting::{quad_light, Lighting};
+use crate::settings::{base_variant, MeshSettings};
+use crate::{tint, BlockEntityKind, BlockEntityRef, BlockSource, Mesh, Vertex};
 
 /// The baked models and the texture layers the model mesher reads.
 ///
@@ -81,68 +85,101 @@ pub fn mesh_chunk_with_models<S: BlockSource + ?Sized>(
     source: &S,
     context: &ModelMeshContext,
 ) -> Mesh {
-    let mut mesh = Mesh::default();
-    let base_x = pos.x * 16;
-    let base_z = pos.z * 16;
-
-    for y in 0..256i32 {
-        for z in 0..16i32 {
-            for x in 0..16i32 {
-                let wx = base_x + x;
-                let wz = base_z + z;
-                let state = source.block(wx, y, wz);
-                // Air is the overwhelming majority of a column: checking it
-                // before the model lookup keeps the hot path cheap.
-                if state.is_air() {
-                    continue;
-                }
-                let position = [wx, y, wz];
-                let variant = context
-                    .models
-                    .model(state)
-                    .and_then(|model| select_variant(model, position));
-                if let Some(variant) = variant {
-                    emit_model_quads(&mut mesh, source, context, state, variant, position);
-                } else if state.is_renderable() {
-                    let tint = context.tints.as_deref().map_or(tint::WHITE, |tints| {
-                        tint::biome_tint(source, tint::tint_class(state), wx, wz, tints)
-                    });
-                    emit_legacy_faces_with(&mut mesh, source, [wx, y, wz], state, tint, |face| {
-                        fallback_layer(state, face, &context.atlas)
-                    });
-                }
-            }
-        }
-    }
-    mesh
+    mesh_chunk_with_settings(pos, source, context, MeshSettings::default())
 }
 
-/// Picks the texture layer of a state that has no baked model.
-///
-/// Water and lava are rendered by 1.8's `BlockFluidRenderer`, not by a
-/// blockstate model: it samples `blocks/water_still`/`lava_still` on the
-/// horizontal faces and `blocks/water_flow`/`lava_flow` on the sides
-/// (`mcp: src/minecraft/client/renderer/BlockFluidRenderer.java`,
-/// `func_178268_a`). Keeping the legacy cube geometry while resolving those
-/// keys in the real atlas avoids sampling an unrelated layer such as a bed.
-/// Other no-model states use the missing-texture checker: this path only
-/// ever emits layers of the atlas it was given, never a procedural layer
-/// (ADR-0012).
-fn fallback_layer(state: BlockState, face: Face, atlas: &AtlasLayout) -> u32 {
-    let fluid_key = match state.id() {
-        8 | 9 => Some(match face {
-            Face::Up | Face::Down => "blocks/water_still",
-            _ => "blocks/water_flow",
-        }),
-        10 | 11 => Some(match face {
-            Face::Up | Face::Down => "blocks/lava_still",
-            _ => "blocks/lava_flow",
-        }),
-        _ => None,
+/// [`mesh_chunk_with_models`] with the player's [`MeshSettings`]. A block that
+/// emits light is lit flat whatever `Smooth Lighting` says
+/// (`BlockModelRenderer.renderModel` requires `getLightValue() == 0` for the
+/// smooth path).
+#[must_use]
+pub fn mesh_chunk_with_settings<S: BlockSource + ?Sized>(
+    pos: ChunkPos,
+    source: &S,
+    context: &ModelMeshContext,
+    settings: MeshSettings,
+) -> Mesh {
+    // The atlas layers of the two liquids, looked up once per job instead of
+    // once per liquid cell (F2-4d).
+    let water = fluid_layers(Liquid::Water, &context.atlas);
+    let lava = fluid_layers(Liquid::Lava, &context.atlas);
+    mesh_sections(pos, source, |mesh, position @ [wx, y, wz]| {
+        let state = source.block(wx, y, wz);
+        // Air is the overwhelming majority of a column: checking it before
+        // the model lookup keeps the hot path cheap.
+        if state.is_air() {
+            return;
+        }
+        if let Some(kind) = BlockEntityKind::of(state) {
+            mesh.block_entities
+                .push(BlockEntityRef::scan(source, position, state));
+            if kind.replaces_model() {
+                return;
+            }
+        }
+        if let Some(liquid) = Liquid::of(state) {
+            let tint = context.tints.as_deref().map_or(tint::WHITE, |tints| {
+                tint::biome_tint(source, tint::tint_class(state), wx, wz, tints)
+            });
+            let layers = match liquid {
+                Liquid::Water => water,
+                Liquid::Lava => lava,
+            };
+            fluid::emit_fluid(mesh, source, position, liquid, layers, tint);
+            return;
+        }
+        let model = actual_state::model_for(&context.models, &source, position, state)
+            .or_else(|| context.models.model(state));
+        let variant =
+            model.and_then(|model| pick_variant(model, position, settings.block_alternatives));
+        let lighting = if light_emission(state) == 0 {
+            settings.lighting
+        } else {
+            Lighting::Flat
+        };
+        if let Some(variant) = variant {
+            let placement = Placement::in_world(position).lit(lighting);
+            emit_model_quads(mesh, source, context, state, variant, placement);
+        } else if state.is_renderable() {
+            let tint = context.tints.as_deref().map_or(tint::WHITE, |tints| {
+                tint::biome_tint(source, tint::tint_class(state), wx, wz, tints)
+            });
+            // No model and not a liquid: the checker, never a procedural
+            // layer index (ADR-0012).
+            let missing = context.atlas.missing_layer();
+            emit_legacy_faces_with(mesh, source, position, (state, lighting), tint, |_| missing);
+        }
+    })
+}
+
+/// The still and flowing layers of a liquid in the atlas
+/// (`BlockFluidRenderer.initAtlasSprites`), or the checker when the atlas
+/// lacks them.
+fn fluid_layers(liquid: Liquid, atlas: &AtlasLayout) -> FluidLayers {
+    let (still, flow) = match liquid {
+        Liquid::Water => ("blocks/water_still", "blocks/water_flow"),
+        Liquid::Lava => ("blocks/lava_still", "blocks/lava_flow"),
     };
-    fluid_key
-        .and_then(|key| atlas.layer(key))
-        .unwrap_or_else(|| atlas.missing_layer())
+    let layer = |key| atlas.layer(key).unwrap_or_else(|| atlas.missing_layer());
+    FluidLayers {
+        still: layer(still),
+        flow: layer(flow),
+    }
+}
+
+/// The variant a block uses: the weighted pick of [`select_variant`], or the
+/// base variant when `block_alternatives` is off
+/// (`BlockRendererDispatcher.getBakedModel`).
+fn pick_variant(
+    model: &BlockModel,
+    position: [i32; 3],
+    alternatives: bool,
+) -> Option<&ModelVariant> {
+    if alternatives {
+        select_variant(model, position)
+    } else {
+        base_variant(model)
+    }
 }
 
 /// Picks the weighted variant of `model` for a block position.
@@ -153,7 +190,7 @@ fn fallback_layer(state: BlockState, face: Face, atlas: &AtlasLayout) -> u32 {
 /// that walk; document order is used here, which changes only which variant a
 /// given position sees, not the distribution. `None` when the model has no
 /// variants (the builder never bakes such a model).
-fn select_variant(model: &BlockModel, position: [i32; 3]) -> Option<&ModelVariant> {
+pub(crate) fn select_variant(model: &BlockModel, position: [i32; 3]) -> Option<&ModelVariant> {
     // Almost every blockstate has a single variant; do not hash for it.
     if let [only] = model.variants.as_slice() {
         return Some(only);
@@ -231,26 +268,63 @@ fn block_offset(position: [i32; 3], kind: OffsetType) -> [f32; 3] {
     [ox, oy, oz]
 }
 
-/// Emits every quad of `variant` at `position`, offset by the block position.
+/// Where and how [`emit_model_quads`] places a model.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Placement {
+    /// The cell the light, tint and vegetation offset are sampled at.
+    pub(crate) position: [i32; 3],
+    /// Extra translation of the whole model (a block moved by a piston).
+    pub(crate) shift: [f32; 3],
+    /// Whether `cullface` quads are dropped against an occluding neighbour.
+    pub(crate) cull: bool,
+    /// How the quads are lit.
+    pub(crate) lighting: Lighting,
+}
+
+impl Placement {
+    /// A block standing in the world: no shift, hidden faces culled.
+    fn in_world(position: [i32; 3]) -> Self {
+        Self {
+            position,
+            shift: [0.0; 3],
+            cull: true,
+            lighting: Lighting::Smooth,
+        }
+    }
+
+    /// The same placement lit with `lighting`.
+    fn lit(self, lighting: Lighting) -> Self {
+        Self { lighting, ..self }
+    }
+}
+
+/// Emits every quad of `variant` at the placement's cell, offset by the block
+/// position.
 ///
 /// `state` is the block rendered by the quad; it is only needed for the
 /// same-state half of the cull rule.
-fn emit_model_quads<S: BlockSource + ?Sized>(
+pub(crate) fn emit_model_quads<S: BlockSource + ?Sized>(
     mesh: &mut Mesh,
     source: &S,
     context: &ModelMeshContext,
     state: BlockState,
     variant: &ModelVariant,
-    position: [i32; 3],
+    placement: Placement,
 ) {
+    let position = placement.position;
     let [x, y, z] = position;
     let [ox, oy, oz] = block_offset(position, offset_type(state));
+    let [ox, oy, oz] = [
+        ox + placement.shift[0],
+        oy + placement.shift[1],
+        oz + placement.shift[2],
+    ];
     // Tint is constant per block, so compute the 3×3 biome average at most
     // once and reuse it for every tinted quad (grass top + side overlay,
     // six leaf faces, ...). Untinted quads never sample the colormaps.
     let mut block_tint = None;
     for quad in &variant.model.quads {
-        if let Some(cullface) = quad.cullface {
+        if let Some(cullface) = quad.cullface.filter(|_| placement.cull) {
             let offset = cullface.offset();
             let neighbour = source.block(x + offset[0], y + offset[1], z + offset[2]);
             if occludes(neighbour, state) {
@@ -278,6 +352,7 @@ fn emit_model_quads<S: BlockSource + ?Sized>(
             &quad.positions,
             variant.model.ambient_occlusion,
             quad.shade,
+            placement.lighting,
         );
         let vertices = std::array::from_fn(|index| {
             let corner = quad.positions[index];
@@ -302,7 +377,6 @@ fn emit_model_quads<S: BlockSource + ?Sized>(
 mod tests {
     use super::*;
     use umicraft_model::ResolvedModel;
-    use umicraft_model::MISSING_TEXTURE;
 
     fn variant(weight: u32) -> ModelVariant {
         ModelVariant {
@@ -337,48 +411,27 @@ mod tests {
     }
 
     #[test]
-    fn modelless_fluids_use_the_real_atlas_keys() {
+    fn liquids_take_their_still_and_flowing_layers_from_the_atlas() {
         let atlas = AtlasLayout::from_keys([
             "blocks/water_still",
             "blocks/water_flow",
             "blocks/lava_still",
             "blocks/lava_flow",
         ]);
-        let water = BlockState::new(9, 0);
-        assert_eq!(
-            fallback_layer(water, Face::Up, &atlas),
-            atlas.layer("blocks/water_still").expect("water still")
-        );
-        assert_eq!(
-            fallback_layer(water, Face::North, &atlas),
-            atlas.layer("blocks/water_flow").expect("water flow")
-        );
-        let lava = BlockState::new(10, 0);
-        assert_eq!(
-            fallback_layer(lava, Face::Down, &atlas),
-            atlas.layer("blocks/lava_still").expect("lava still")
-        );
-        assert_eq!(
-            fallback_layer(lava, Face::East, &atlas),
-            atlas.layer("blocks/lava_flow").expect("lava flow")
-        );
-        // Any other no-model state gets the checker, never a random atlas
-        // layer from the procedural table.
-        assert_eq!(
-            fallback_layer(BlockState::new(1, 0), Face::Up, &atlas),
-            atlas.layer(MISSING_TEXTURE).expect("missing layer")
-        );
+        let water = fluid_layers(Liquid::Water, &atlas);
+        assert_eq!(Some(water.still), atlas.layer("blocks/water_still"));
+        assert_eq!(Some(water.flow), atlas.layer("blocks/water_flow"));
+        let lava = fluid_layers(Liquid::Lava, &atlas);
+        assert_eq!(Some(lava.still), atlas.layer("blocks/lava_still"));
+        assert_eq!(Some(lava.flow), atlas.layer("blocks/lava_flow"));
 
-        // An atlas without the fluid textures still answers with one of its
-        // own layers: the checker, never a procedural layer index.
+        // An atlas without the liquid textures answers with its checker,
+        // never a procedural layer index (ADR-0012).
         let empty = AtlasLayout::default();
+        let missing = fluid_layers(Liquid::Water, &empty);
         assert_eq!(
-            fallback_layer(water, Face::Up, &empty),
-            empty.missing_layer()
-        );
-        assert_eq!(
-            fallback_layer(BlockState::new(1, 0), Face::Up, &empty),
-            empty.missing_layer()
+            (missing.still, missing.flow),
+            (empty.missing_layer(), empty.missing_layer())
         );
     }
 

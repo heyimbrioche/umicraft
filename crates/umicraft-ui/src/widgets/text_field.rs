@@ -15,22 +15,31 @@
 //! character index with the same metrics the renderer uses. W5 passes the
 //! atlas it loaded, or [`FontAtlas::fallback`] before the assets exist.
 //!
-//! The caret is static while the field is focused: the widget has no clock,
-//! because the debug screen must stay a pure function of its state and input.
+//! The look is vanilla's `GuiTextField`: a 1 unit `0xA0A0A0` border around a
+//! black fill (focused or not), white-grey text inset 4 units and a `_` caret
+//! after the text, or a thin bar inside it. The widget has no clock, so the
+//! caret blink (`cursorCounter / 6 % 2`) counts [`TextFieldState::tick`]
+//! calls; a field nobody ticks keeps a steady caret.
 //!
 //! Editing uses the input events of the current frame, in arrival order:
 //!
-//! - [`InputEvent::Text`] inserts every non-control character at the caret;
+//! - [`InputEvent::Text`] inserts every non-control character at the caret,
+//!   replacing the selection if there is one;
 //! - Backspace removes the character before the caret and Delete the one after
-//!   it;
+//!   it, or the selection; with Control they remove a word;
 //! - Home and End jump to the first and last boundary;
-//! - the left and right arrows move the caret by one character.
+//! - the left and right arrows move the caret by one character, by a word with
+//!   Control; Shift extends the selection instead of moving it;
+//! - Control+A selects everything, Control+C copies the selection, Control+X
+//!   cuts it and [`InputEvent::Paste`] (Control+V) replaces it with the
+//!   clipboard text, as `GuiTextField.textboxKeyTyped` does. A word ends at a
+//!   space.
 //!
-//! M4 has no selection and no clipboard. Ctrl/Meta text events are ignored so
-//! that a future shortcut handler does not accidentally insert a character.
+//! Text events while Control or Meta is held are ignored, so a shortcut never
+//! inserts its letter; AltGr (Control and Alt together) still types.
 
 use crate::context::{Ui, UiResponse};
-use crate::draw::TextStyle;
+use crate::draw::{Color, TextStyle};
 use crate::geom::{Insets, Rect};
 use crate::id::WidgetId;
 use crate::input::{InputEvent, Key};
@@ -39,12 +48,16 @@ use crate::text::FontAtlas;
 use super::style;
 use super::util;
 
-/// Distance between the field border and its text, in pixels.
-const FIELD_PADDING: f32 = 6.0;
-/// Width of the caret in physical pixels.
-const CARET_WIDTH: f32 = 1.5;
-/// Shown while the field is empty and does not own the focus.
-const PLACEHOLDER: &str = "TYPE HERE";
+/// Border width, in GUI units (`drawRect(x - 1, ...)`).
+const BORDER_UNITS: f32 = 1.0;
+/// Distance between the field edge and its text, in GUI units.
+const TEXT_INSET_UNITS: f32 = 4.0;
+/// Glyph height used to centre the text (`(height - 8) / 2`).
+const GLYPH_UNITS: f32 = 8.0;
+/// Ticks per half period of the caret blink (`cursorCounter / 6 % 2`).
+const BLINK_TICKS: u32 = 6;
+/// The caret glyph drawn after the text.
+const CARET_GLYPH: &str = "_";
 
 /// The editable state of one text field.
 ///
@@ -55,7 +68,12 @@ const PLACEHOLDER: &str = "TYPE HERE";
 pub struct TextFieldState {
     text: String,
     caret: usize,
+    /// The fixed end of the selection; equal to `caret` when nothing is
+    /// selected. `caret` is the end that moves (`GuiTextField.selectionEnd`).
+    anchor: usize,
     scroll: f32,
+    blink: u32,
+    disabled: bool,
 }
 
 impl TextFieldState {
@@ -75,8 +93,35 @@ impl TextFieldState {
         Self {
             text,
             caret,
+            anchor: caret,
             scroll: 0.0,
+            blink: 0,
+            disabled: false,
         }
+    }
+
+    /// Turns editing off (`GuiTextField.setEnabled(false)`): the field ignores
+    /// clicks and keys, shows no caret and draws its text in the dim
+    /// `0x707070`.
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+    }
+
+    /// Whether the field is disabled.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Advances the caret blink by one game tick (`GuiTextField.updateCursorCounter`).
+    pub fn tick(&mut self) {
+        self.blink = self.blink.wrapping_add(1);
+    }
+
+    /// Whether the caret is in the visible half of its blink period.
+    #[must_use]
+    pub fn caret_blink_on(&self) -> bool {
+        (self.blink / BLINK_TICKS).is_multiple_of(2)
     }
 
     /// The current text.
@@ -93,6 +138,7 @@ impl TextFieldState {
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = single_line(&text.into());
         self.caret = self.caret.min(self.char_count());
+        self.anchor = self.caret;
         self.scroll = 0.0;
     }
 
@@ -104,7 +150,67 @@ impl TextFieldState {
 
     /// Moves the caret to `caret`, clamped to `0..=char_count`.
     pub fn set_caret(&mut self, caret: usize) {
+        self.collapse(caret);
+    }
+
+    /// Whether some text is selected.
+    #[must_use]
+    pub fn has_selection(&self) -> bool {
+        self.anchor != self.caret
+    }
+
+    /// The selected text, empty when nothing is selected.
+    #[must_use]
+    pub fn selected_text(&self) -> String {
+        let (start, end) = self.selection();
+        self.text.chars().skip(start).take(end - start).collect()
+    }
+
+    /// Selects the whole text, the caret at the start
+    /// (`setCursorPositionEnd` then `setSelectionPos(0)`).
+    pub fn select_all(&mut self) {
+        self.anchor = self.char_count();
+        self.caret = 0;
+    }
+
+    /// The selection as `char` indices, start before end.
+    fn selection(&self) -> (usize, usize) {
+        (self.anchor.min(self.caret), self.anchor.max(self.caret))
+    }
+
+    /// Moves the caret to `caret` and drops the selection.
+    fn collapse(&mut self, caret: usize) {
         self.caret = caret.min(self.char_count());
+        self.anchor = self.caret;
+    }
+
+    /// Moves the caret to `caret`, keeping the other end of the selection.
+    fn extend_to(&mut self, caret: usize) {
+        self.caret = caret.min(self.char_count());
+    }
+
+    /// `GuiTextField.getNthWordFromPos` for one word: the start of the word
+    /// before `from` (`forward == false`) or the start of the next one. A word
+    /// ends at a space.
+    fn word_from(&self, from: usize, forward: bool) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut at = from.min(chars.len());
+        if forward {
+            while at < chars.len() && chars[at] != ' ' {
+                at += 1;
+            }
+            while at < chars.len() && chars[at] == ' ' {
+                at += 1;
+            }
+        } else {
+            while at > 0 && chars[at - 1] == ' ' {
+                at -= 1;
+            }
+            while at > 0 && chars[at - 1] != ' ' {
+                at -= 1;
+            }
+        }
+        at
     }
 
     /// The horizontal scroll offset in pixels; zero shows the start of the
@@ -140,58 +246,70 @@ impl TextFieldState {
             .map_or(self.text.len(), |(index, _)| index)
     }
 
-    /// Inserts the non-control characters of `typed` at the caret.
+    /// Replaces the selection (or nothing, at the caret) with the non-control
+    /// characters of `typed` (`GuiTextField.writeText`).
     ///
     /// Returns true when the text changed.
     fn insert(&mut self, typed: &str) -> bool {
         let mut filtered = String::with_capacity(typed.len());
         filtered.extend(typed.chars().filter(|character| !character.is_control()));
-        if filtered.is_empty() {
+        let (start, end) = self.selection();
+        if filtered.is_empty() && start == end {
             return false;
         }
-
-        let byte = self.byte_index(self.caret);
-        self.text.insert_str(byte, &filtered);
-        self.caret += filtered.chars().count();
+        let (from, to) = (self.byte_index(start), self.byte_index(end));
+        self.text.replace_range(from..to, &filtered);
+        self.collapse(start + filtered.chars().count());
         true
     }
 
-    /// Removes the character before the caret.
+    /// Removes the selection, or the character before the caret.
     ///
     /// Returns true when the text changed.
     fn backspace(&mut self) -> bool {
+        if self.has_selection() {
+            return self.insert("");
+        }
         if self.caret == 0 {
             return false;
         }
-        let end = self.byte_index(self.caret);
-        let start = self.byte_index(self.caret - 1);
-        self.text.replace_range(start..end, "");
-        self.caret -= 1;
-        true
+        self.anchor = self.caret - 1;
+        self.insert("")
     }
 
-    /// Removes the character after the caret.
+    /// Removes the selection, or the character after the caret.
     ///
     /// Returns true when the text changed.
     fn delete(&mut self) -> bool {
+        if self.has_selection() {
+            return self.insert("");
+        }
         if self.caret >= self.char_count() {
             return false;
         }
-        let start = self.byte_index(self.caret);
-        let end = self.byte_index(self.caret + 1);
-        self.text.replace_range(start..end, "");
-        true
+        self.anchor = self.caret + 1;
+        self.insert("")
+    }
+
+    /// Removes the selection, or the word before or after the caret
+    /// (`GuiTextField.deleteWords`).
+    fn delete_word(&mut self, forward: bool) -> bool {
+        if !self.has_selection() {
+            self.anchor = self.word_from(self.caret, forward);
+        }
+        self.insert("")
     }
 
     /// Moves the caret to `caret`, clamped, and reports whether it moved.
-    fn move_caret(&mut self, caret: usize) -> bool {
+    fn move_caret(&mut self, caret: usize, extend: bool) -> bool {
         let caret = caret.min(self.char_count());
-        if caret == self.caret {
-            false
+        let moved = caret != self.caret || (!extend && self.has_selection());
+        if extend {
+            self.extend_to(caret);
         } else {
-            self.caret = caret;
-            true
+            self.collapse(caret);
         }
+        moved
     }
 }
 
@@ -241,59 +359,105 @@ pub fn text_field(
     atlas: &FontAtlas,
     state: &mut TextFieldState,
 ) -> UiResponse {
+    text_field_scaled(ui, id, rect, atlas, state, style::TEXT_SCALE)
+}
+
+/// Like [`text_field`], with one GUI unit of the field (border, text inset,
+/// glyph size) equal to `scale` pixels. The menu screens pass the GUI scale so
+/// the field is 200x20 units like `GuiTextField`.
+pub fn text_field_scaled(
+    ui: &mut Ui,
+    id: WidgetId,
+    rect: Rect,
+    atlas: &FontAtlas,
+    state: &mut TextFieldState,
+    scale: f32,
+) -> UiResponse {
     let mut response = ui.response(id, rect);
-    let scale = style::TEXT_SCALE;
 
     // A caller may have replaced the text or the caret between frames.
     state.caret = state.caret.min(state.char_count());
 
-    let inner = rect.deflate(Insets::all(FIELD_PADDING));
+    let inner = rect.deflate(Insets {
+        left: TEXT_INSET_UNITS * scale,
+        right: TEXT_INSET_UNITS * scale,
+        top: BORDER_UNITS * scale,
+        bottom: BORDER_UNITS * scale,
+    });
     let mut changed = false;
 
-    if response.clicked {
+    if response.clicked && !state.disabled {
         if let Some(position) = util::last_primary_press(ui) {
             let local_x = position[0] - inner.x + state.scroll;
             let caret = atlas.x_to_char_index(&state.text, local_x, scale);
-            if state.caret != caret {
-                state.caret = caret;
-                changed = true;
-            }
+            let extend = ui.input().modifiers.shift;
+            changed |= state.move_caret(caret, extend);
         }
     }
 
-    if response.focused {
-        // Text events may be IME or paste and can carry several characters.
-        // Ctrl/Meta combinations belong to future shortcuts, not to the text.
-        let shortcut = ui.input().modifiers.control || ui.input().modifiers.meta;
+    if response.focused && !state.disabled {
+        let modifiers = ui.input().modifiers;
+        // Control (Command on macOS) shortcuts; AltGr reports Control and Alt
+        // together and must still type its characters.
+        let shortcut = (modifiers.control || modifiers.meta) && !modifiers.alt;
+        let combo = shortcut && !modifiers.shift;
+        let mut copied = None;
         for event in &ui.input().events {
             match event {
+                // Text events may be IME or paste and can carry several
+                // characters.
                 InputEvent::Text(text) if !shortcut => changed |= state.insert(text),
+                InputEvent::Paste(text) => changed |= state.insert(text),
+                InputEvent::KeyPressed(Key::A) if combo => {
+                    state.select_all();
+                    changed = true;
+                }
+                InputEvent::KeyPressed(Key::C) if combo => {
+                    copied = Some(state.selected_text());
+                }
+                InputEvent::KeyPressed(Key::X) if combo => {
+                    copied = Some(state.selected_text());
+                    changed |= state.insert("");
+                }
+                InputEvent::KeyPressed(Key::Backspace) if shortcut => {
+                    changed |= state.delete_word(false);
+                }
+                InputEvent::KeyPressed(Key::Delete) if shortcut => {
+                    changed |= state.delete_word(true);
+                }
                 InputEvent::KeyPressed(Key::Backspace) => changed |= state.backspace(),
                 InputEvent::KeyPressed(Key::Delete) => changed |= state.delete(),
-                InputEvent::KeyPressed(Key::Home) => changed |= state.move_caret(0),
+                InputEvent::KeyPressed(Key::Home) => {
+                    changed |= state.move_caret(0, modifiers.shift);
+                }
                 InputEvent::KeyPressed(Key::End) => {
                     let end = state.char_count();
-                    changed |= state.move_caret(end);
+                    changed |= state.move_caret(end, modifiers.shift);
                 }
-                InputEvent::KeyPressed(Key::ArrowLeft) => {
-                    let caret = state.caret.saturating_sub(1);
-                    changed |= state.move_caret(caret);
-                }
-                InputEvent::KeyPressed(Key::ArrowRight) => {
-                    let caret = state.caret + 1;
-                    changed |= state.move_caret(caret);
+                InputEvent::KeyPressed(key @ (Key::ArrowLeft | Key::ArrowRight)) => {
+                    let forward = *key == Key::ArrowRight;
+                    let target = if shortcut {
+                        state.word_from(state.caret, forward)
+                    } else if forward {
+                        state.caret + 1
+                    } else {
+                        state.caret.saturating_sub(1)
+                    };
+                    changed |= state.move_caret(target, modifiers.shift);
                 }
                 _ => {}
             }
         }
+        if let Some(text) = copied.filter(|text| !text.is_empty()) {
+            ui.set_clipboard(text);
+        }
     }
 
-    let line_height = atlas.line_height(scale);
     let caret_x = atlas.char_index_to_x(&state.text, state.caret, scale);
     let text_width = atlas.measure(&state.text, scale);
-    // Reserve the caret width so the caret at the end of a full line stays
-    // inside the clip instead of being cut in half at the right edge.
-    let caret_space = (inner.width - CARET_WIDTH).max(0.0);
+    // Reserve the caret glyph so the caret at the end of a full line stays
+    // inside the clip instead of being cut at the right edge.
+    let caret_space = (inner.width - atlas.measure(CARET_GLYPH, scale)).max(0.0);
     if caret_x < state.scroll {
         state.scroll = caret_x;
     } else if caret_x > state.scroll + caret_space {
@@ -302,46 +466,15 @@ pub fn text_field(
     state.scroll = state.scroll.clamp(0.0, (text_width - caret_space).max(0.0));
 
     if !rect.is_empty() {
-        let border = if response.focused {
-            style::FIELD_BORDER_FOCUSED
-        } else {
-            style::FIELD_BORDER
-        };
-        ui.draw().rect(rect, border);
-        ui.draw()
-            .rect(rect.deflate(Insets::all(1.0)), style::FIELD_BACKGROUND);
-
-        if !inner.is_empty() {
-            let text_y = inner.y + (inner.height - line_height).max(0.0) * 0.5;
-            ui.push_clip(inner);
-            if state.text.is_empty() {
-                if !response.focused {
-                    ui.draw().text(
-                        [inner.x, text_y],
-                        PLACEHOLDER,
-                        TextStyle::new(scale, style::TEXT_DIM),
-                    );
-                }
-            } else {
-                ui.draw().text(
-                    [inner.x - state.scroll, text_y],
-                    state.text.as_str(),
-                    TextStyle::new(scale, style::TEXT),
-                );
-            }
-            if response.focused {
-                ui.draw().rect(
-                    Rect::new(
-                        inner.x - state.scroll + caret_x,
-                        text_y,
-                        CARET_WIDTH,
-                        line_height,
-                    ),
-                    style::CARET,
-                );
-            }
-            ui.pop_clip();
-        }
+        draw_field(
+            ui,
+            rect,
+            inner,
+            atlas,
+            state,
+            response.focused && !state.disabled,
+            scale,
+        );
     }
 
     if changed {
@@ -349,6 +482,88 @@ pub fn text_field(
         ui.mark_changed(id);
     }
     response
+}
+
+/// Draws the border, the fill, the text and the caret of a field
+/// (`GuiTextField.drawTextBox`).
+fn draw_field(
+    ui: &mut Ui,
+    rect: Rect,
+    inner: Rect,
+    atlas: &FontAtlas,
+    state: &TextFieldState,
+    focused: bool,
+    scale: f32,
+) {
+    ui.draw().rect(rect, style::FIELD_BORDER);
+    ui.draw().rect(
+        rect.deflate(Insets::all(BORDER_UNITS * scale)),
+        style::FIELD_BACKGROUND,
+    );
+    if inner.is_empty() {
+        return;
+    }
+    let text_y = rect.y + (rect.height - GLYPH_UNITS * scale) * 0.5;
+    let text_x = inner.x - state.scroll;
+    ui.push_clip(inner);
+    if state.has_selection() {
+        let (start, end) = state.selection();
+        let from = text_x + atlas.char_index_to_x(&state.text, start, scale);
+        let to = text_x + atlas.char_index_to_x(&state.text, end, scale);
+        ui.draw().rect(
+            Rect::new(from, text_y - scale, to - from, (GLYPH_UNITS + 2.0) * scale),
+            style::SELECTION,
+        );
+    }
+    if !state.text.is_empty() {
+        let (color, shadow) = if state.disabled {
+            (
+                style::TEXT_FIELD_DISABLED,
+                style::TEXT_FIELD_DISABLED_SHADOW,
+            )
+        } else {
+            (style::TEXT_FIELD, style::TEXT_FIELD_SHADOW)
+        };
+        draw_shadowed(ui, [text_x, text_y], &state.text, (color, shadow), scale);
+    }
+    if focused && state.caret_blink_on() {
+        let caret_x = text_x + atlas.char_index_to_x(&state.text, state.caret, scale);
+        if state.caret < state.text.chars().count() {
+            let bar = Rect::new(
+                caret_x - scale,
+                text_y - scale,
+                scale,
+                (GLYPH_UNITS + 2.0) * scale,
+            );
+            ui.draw().rect(bar, style::CARET_BAR);
+        } else {
+            draw_shadowed(
+                ui,
+                [caret_x, text_y],
+                CARET_GLYPH,
+                (style::TEXT_FIELD, style::TEXT_FIELD_SHADOW),
+                scale,
+            );
+        }
+    }
+    ui.pop_clip();
+}
+
+/// Draws `text` with the vanilla shadow (a quarter of the brightness, one
+/// unit down and right, `drawStringWithShadow`).
+fn draw_shadowed(
+    ui: &mut Ui,
+    at: [f32; 2],
+    text: &str,
+    (color, shadow): (Color, Color),
+    scale: f32,
+) {
+    ui.draw().text(
+        [at[0] + scale, at[1] + scale],
+        text,
+        TextStyle::new(scale, shadow),
+    );
+    ui.draw().text(at, text, TextStyle::new(scale, color));
 }
 
 /// Removes every control character, keeping the field single-line.

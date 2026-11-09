@@ -8,7 +8,10 @@ use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
 use umicraft_client::args::{Args, Mode, USAGE};
-use umicraft_client::{block_demo, entity_demo, headless, screenshot, setup_cli, ui_demo, window};
+use umicraft_client::{
+    audio_bridge, bench_scene, block_demo, entity_demo, headless, hud_demo, launch_session,
+    screenshot, setup_cli, ui_demo, window,
+};
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -17,12 +20,17 @@ fn main() -> ExitCode {
         )
         .init();
 
+    // Kept alive for the whole run: dropping it stops the puffin stream.
+    let _profiler = umicraft_core::profiling::serve();
+
     let words: Vec<String> = std::env::args().skip(1).collect();
     if words.iter().any(|word| word == "--help" || word == "-h") {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let args = match Args::parse(&words) {
+    let parsed = launch_session::split(&words)
+        .and_then(|(rest, session)| Args::parse(&rest).map(|args| Args { session, ..args }));
+    let args = match parsed {
         Ok(args) => args,
         Err(message) => {
             eprintln!("{message}");
@@ -32,10 +40,13 @@ fn main() -> ExitCode {
 
     let result = match args.mode() {
         Mode::SetupAssets => setup_cli::run(),
+        Mode::AudioProbe => audio_bridge::probe::run(),
         Mode::UiDemo => ui_demo::run(&args),
+        Mode::HudDemo => hud_demo::run(&args),
         Mode::BlockDemo => block_demo::run(&args),
         Mode::EntityDemo => entity_demo::run(&args),
         Mode::Headless => headless::run(&args),
+        Mode::BenchScene => bench_scene::run(&args),
         Mode::Screenshot => screenshot::run(&args),
         Mode::Windowed => window::run(args.clone()),
     };

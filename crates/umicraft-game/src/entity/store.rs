@@ -5,11 +5,38 @@
 
 use std::collections::BTreeMap;
 
-use glam::{DVec3, Vec3};
+use std::sync::Arc;
 
-use super::types::{
-    EntityFlags, EntityFrameData, EntityId, EntityKind, EntityRecord, EntityRenderSnapshot,
+use glam::{DVec3, Vec3};
+use umicraft_protocol::packets::play::Metadata;
+
+use crate::physics::EYE_HEIGHT;
+use crate::view::ViewEffects;
+use crate::RenderState;
+
+use super::{
+    BedPose, BodyYaw, EntityFlags, EntityFrameData, EntityId, EntityItem, EntityKind, EntityRecord,
+    EntityRenderSnapshot, PlayerProfile, Variant,
 };
+
+/// Data watcher entry of the entity flags (MCP `Entity.entityInit`).
+/// Ticks one flash of a lightning bolt lasts here; the bolt is redrawn with a
+/// new shape at each flash.
+pub const LIGHTNING_FLASH_TICKS: u32 = 3;
+
+const ENTITY_FLAGS: u8 = 0;
+/// Data watcher entry of the player skin parts (MCP `EntityPlayer.entityInit`).
+const PLAYER_SKIN_PARTS: u8 = 10;
+/// Data watcher entry of the health (MCP `EntityLivingBase.entityInit`).
+const LIVING_HEALTH: u8 = 6;
+
+/// The limb swing amplitude a hurt entity jolts to
+/// (MCP `EntityLivingBase.handleStatusUpdate`, `limbSwingAmount = 1.5`).
+const HURT_LIMB_AMOUNT: f32 = 1.5;
+
+/// The height below which an entity is out of the world (MCP
+/// `Entity.onEntityUpdate`, `posY < -64.0D`).
+const VOID_Y: f64 = -64.0;
 
 /// The storage and simulation of non-local entities on the game thread.
 #[derive(Debug, Clone, Default)]
@@ -38,6 +65,12 @@ impl EntityStore {
         self.entities.is_empty()
     }
 
+    /// The kind of a tracked entity.
+    #[must_use]
+    pub fn kind(&self, id: EntityId) -> Option<EntityKind> {
+        self.entities.get(&id).map(|entity| entity.kind)
+    }
+
     /// Clears all tracked entities.
     pub fn clear(&mut self) {
         self.entities.clear();
@@ -52,12 +85,12 @@ impl EntityStore {
         position: DVec3,
         yaw: f32,
         pitch: f32,
-        held_item: Option<u16>,
+        held: Option<EntityItem>,
         flags: EntityFlags,
     ) {
         let mut record = EntityRecord::new(id, EntityKind::Player, position, yaw, pitch);
         record.uuid = Some(uuid);
-        record.held_item = held_item;
+        record.held = held;
         record.flags = flags;
         self.entities.insert(id, record);
     }
@@ -79,13 +112,19 @@ impl EntityStore {
         let mut record = EntityRecord::new(id, kind, position, yaw, pitch);
         record.head_yaw = head_yaw;
         record.previous_head_yaw = head_yaw;
-        record.target_head_yaw = head_yaw;
+        // MCP `handleSpawnMob`: `renderYawOffset = rotationYawHead = head`.
+        record.body_yaw = BodyYaw::new(head_yaw);
         record.velocity = velocity;
         record.flags = flags;
         self.entities.insert(id, record);
     }
 
     /// Spawns an object or item.
+    ///
+    /// `data` is the object-specific integer of `Spawn Object`; for an item
+    /// frame it is the wall direction (MCP `EntityHanging.facingDirection`
+    /// horizontal index), clamped to `0..=3`.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_object(
         &mut self,
         id: EntityId,
@@ -94,51 +133,242 @@ impl EntityStore {
         pitch: f32,
         yaw: f32,
         velocity: Vec3,
+        data: i32,
     ) {
         let kind = EntityKind::from_object_type(object_type);
+        // `EntityLeashKnot.updateBoundingBox`: the knot sits on the middle of
+        // its fence block.
+        let position = if kind == EntityKind::LeashKnot {
+            position.floor() + DVec3::splat(0.5)
+        } else {
+            position
+        };
         let mut record = EntityRecord::new(id, kind, position, yaw, pitch);
         record.velocity = velocity;
+        record.object_data = data;
+        if kind == EntityKind::ItemFrame {
+            record.frame_direction = data.clamp(0, 3) as u8;
+        }
+        if kind == EntityKind::FishHook {
+            // MCP `NetHandlerPlayClient.handleSpawnObject`: the bobber
+            // registers itself on its angler (`fishEntity`).
+            if let Some(angler) = self.entities.get_mut(&EntityId(data)) {
+                angler.bobber = Some(id);
+            }
+        }
+        self.entities.insert(id, record);
+    }
+
+    /// Spawns an experience orb worth `count` (`Spawn Experience Orb`).
+    pub fn spawn_xp_orb(&mut self, id: EntityId, position: DVec3, count: i16) {
+        let mut record = EntityRecord::new(id, EntityKind::XpOrb, position, 0.0, 0.0);
+        record.object_data = i32::from(count);
+        self.entities.insert(id, record);
+    }
+
+    /// Seats `rider` on `vehicle`, or stands it up when `vehicle` is `None`
+    /// (`Attach Entity` with leash 0). The seat is followed in [`Self::tick`].
+    ///
+    /// As `NetHandlerPlayClient.handleEntityAttach` and `Entity.mountEntity`
+    /// do: a rider the client does not track is ignored, a vehicle it does not
+    /// track makes the call a dismount, and a mount that would seat the
+    /// vehicle on its own rider, however far up the chain, is refused.
+    pub fn attach(&mut self, rider: EntityId, vehicle: Option<EntityId>) {
+        if !self.entities.contains_key(&rider) {
+            return;
+        }
+        let Some(vehicle) = vehicle.filter(|id| self.entities.contains_key(id)) else {
+            self.dismount(rider);
+            return;
+        };
+        let mut seat = self
+            .entities
+            .get(&vehicle)
+            .and_then(|record| record.vehicle);
+        for _ in 0..self.entities.len() {
+            match seat {
+                Some(id) if id == rider => return,
+                Some(id) => seat = self.entities.get(&id).and_then(|record| record.vehicle),
+                None => break,
+            }
+        }
+        if let Some(record) = self.entities.get_mut(&rider) {
+            record.vehicle = Some(vehicle);
+        }
+    }
+
+    /// `Entity.mountEntity(null)`: the rider leaves its vehicle and is put
+    /// right over it, where it stays until it moves or falls. Nothing happens
+    /// to an entity that rides nothing.
+    fn dismount(&mut self, rider: EntityId) {
+        let Some(vehicle) = self.entities.get(&rider).and_then(|record| record.vehicle) else {
+            return;
+        };
+        let top = self
+            .entities
+            .get(&vehicle)
+            .map(crate::riding::dismount_position);
+        if let Some(record) = self.entities.get_mut(&rider) {
+            record.vehicle = None;
+            if let Some(top) = top {
+                // `setLocationAndAngles` also sets the previous position, so
+                // the rider does not glide there; the target is reset so it
+                // does not glide back to where the server last said it was.
+                record.position = top;
+                record.previous_position = top;
+                record.target_position = top;
+            }
+        }
+    }
+
+    /// Sends the entity `item` flying to `collector` (`Collect Item`), half a
+    /// block over its feet; `local` is where the local player is, who is not
+    /// tracked. An item that is not tracked is ignored.
+    pub fn collect(&mut self, item: EntityId, collector: EntityId, local: DVec3) {
+        let target = self
+            .entities
+            .get(&collector)
+            .map_or(local, |record| record.position)
+            + DVec3::Y * 0.5;
+        if let Some(record) = self.entities.get_mut(&item) {
+            record.collecting = Some(super::record::Collecting {
+                start: record.position,
+                target,
+                ticks: 0,
+            });
+        }
+    }
+
+    /// Ties `entity` to `holder`, or frees it when `holder` is `None`
+    /// (`Attach Entity` with leash 1).
+    pub fn set_leash(&mut self, entity: EntityId, holder: Option<EntityId>) {
+        if let Some(record) = self.entities.get_mut(&entity) {
+            record.leash = holder;
+        }
+    }
+
+    /// Spawns a lightning bolt (`Spawn Global Entity`, type 1). The reference
+    /// draws its shape from a random seed the client picks; the id stands in.
+    pub fn spawn_lightning(&mut self, id: EntityId, position: DVec3) {
+        let mut record = EntityRecord::new(id, EntityKind::Lightning, position, 0.0, 0.0);
+        record.object_data = id.0.wrapping_mul(0x9E37_79B1_u32 as i32);
+        self.entities.insert(id, record);
+    }
+
+    /// Whether a lightning bolt is alive, which flashes the sky
+    /// (`EntityLightningBolt.onUpdate` on a client world).
+    #[must_use]
+    pub fn lightning_flashing(&self) -> bool {
+        self.entities
+            .values()
+            .any(|entity| entity.kind == EntityKind::Lightning)
+    }
+
+    /// Spawns a painting on `block` facing `facing` (`Spawn Painting`). An
+    /// unknown title is ignored: the reference would have no artwork to draw.
+    pub fn spawn_painting(&mut self, id: EntityId, title: &str, block: [i32; 3], facing: u8) {
+        let Some(index) = super::painting::art_index(title) else {
+            return;
+        };
+        let centre = super::painting::centre(block, facing, &super::painting::ARTS[index]);
+        // `EntityHanging.updateFacingWithBoundingBox`: the yaw is 90 per index.
+        let mut record = EntityRecord::new(
+            id,
+            EntityKind::Painting,
+            centre,
+            f32::from(facing & 3) * 90.0,
+            0.0,
+        );
+        record.object_data = index as i32;
         self.entities.insert(id, record);
     }
 
     /// Removes entities by network id.
     pub fn destroy(&mut self, entity_ids: &[i32]) {
         for &id in entity_ids {
+            // `World.removeEntity`: whatever rides the entity is put over it.
+            let riders: Vec<EntityId> = self
+                .entities
+                .iter()
+                .filter(|(_, rider)| rider.vehicle == Some(EntityId(id)))
+                .map(|(rider, _)| *rider)
+                .collect();
+            for rider in riders {
+                self.dismount(rider);
+            }
             self.entities.remove(&EntityId(id));
         }
+        for angler in self.entities.values_mut() {
+            if angler
+                .bobber
+                .is_some_and(|bobber| entity_ids.contains(&bobber.0))
+            {
+                angler.bobber = None;
+            }
+        }
     }
 
-    /// Applies a relative movement delta to an entity.
+    /// The view of an entity for the spectator camera (`Camera`, 0x43).
+    ///
+    /// The eye sits at the player eye height above the interpolated feet;
+    /// the view turns with the head yaw and the pitch (MCP
+    /// `EntityRenderer.orientCamera` follows the view entity). `None` when
+    /// the entity is not tracked, so the caller keeps the local view.
+    #[must_use]
+    pub fn camera_view(&self, id: EntityId, alpha: f32) -> Option<RenderState> {
+        let record = self.entities.get(&id)?;
+        let alpha_f64 = f64::from(alpha.clamp(0.0, 1.0));
+        let feet = record.previous_position.lerp(record.position, alpha_f64);
+        let eye = feet + DVec3::Y * EYE_HEIGHT;
+        let lerp = |from: f32, to: f32| from + (to - from) * alpha.clamp(0.0, 1.0);
+        Some(RenderState {
+            position: eye,
+            eye,
+            orbit_start: Vec3::ZERO,
+            yaw: lerp(record.previous_head_yaw, record.head_yaw).to_radians(),
+            pitch: lerp(record.previous_pitch, record.pitch).to_radians(),
+            on_ground: record.on_ground,
+            effects: ViewEffects::default(),
+        })
+    }
+
+    /// The feet position of a rider seated on the tracked entity `id`, `None`
+    /// when the vehicle is not tracked.
+    #[must_use]
+    pub fn rider_feet(&self, id: EntityId) -> Option<DVec3> {
+        self.entities.get(&id).map(crate::riding::rider_feet)
+    }
+
+    /// Applies a relative movement delta to an entity (`Entity Relative Move`).
+    ///
+    /// The rotation is retargeted to the current one, which stops a turn in
+    /// progress (MCP `handleEntityMovement`).
     pub fn move_relative(&mut self, id: EntityId, delta: DVec3, on_ground: bool) {
         if let Some(entity) = self.entities.get_mut(&id) {
-            entity.target_position += delta;
-            entity.on_ground = on_ground;
-            entity.interpolation_steps = 3;
+            entity.server_position += delta;
+            entity.retarget(entity.server_position, entity.yaw, entity.pitch, on_ground);
         }
     }
 
-    /// Updates entity orientation.
+    /// Updates entity orientation (`Entity Look`).
     pub fn look(&mut self, id: EntityId, yaw: f32, pitch: f32, on_ground: bool) {
         if let Some(entity) = self.entities.get_mut(&id) {
-            entity.target_yaw = yaw;
-            entity.target_pitch = pitch;
-            entity.on_ground = on_ground;
-            entity.interpolation_steps = 3;
+            entity.retarget(entity.server_position, yaw, pitch, on_ground);
         }
     }
 
-    /// Updates entity position delta and orientation.
+    /// Updates entity position delta and orientation (`Entity Look And
+    /// Relative Move`).
     pub fn look_move(&mut self, id: EntityId, delta: DVec3, yaw: f32, pitch: f32, on_ground: bool) {
         if let Some(entity) = self.entities.get_mut(&id) {
-            entity.target_position += delta;
-            entity.target_yaw = yaw;
-            entity.target_pitch = pitch;
-            entity.on_ground = on_ground;
-            entity.interpolation_steps = 3;
+            entity.server_position += delta;
+            entity.retarget(entity.server_position, yaw, pitch, on_ground);
         }
     }
 
-    /// Teleports an entity to an absolute location.
+    /// Teleports an entity to an absolute location (`Entity Teleport`).
+    ///
+    /// Interpolated over 3 ticks like a relative move, as in vanilla.
     pub fn teleport(
         &mut self,
         id: EntityId,
@@ -148,23 +378,15 @@ impl EntityStore {
         on_ground: bool,
     ) {
         if let Some(entity) = self.entities.get_mut(&id) {
-            entity.position = position;
-            entity.previous_position = position;
-            entity.target_position = position;
-            entity.yaw = yaw;
-            entity.previous_yaw = yaw;
-            entity.target_yaw = yaw;
-            entity.pitch = pitch;
-            entity.previous_pitch = pitch;
-            entity.target_pitch = pitch;
-            entity.on_ground = on_ground;
+            entity.teleport_to(position, yaw, pitch, on_ground);
         }
     }
 
-    /// Sets an entity's head yaw.
+    /// Sets an entity's head yaw (`Entity Head Look`); applied at once, not
+    /// glided (MCP `handleEntityHeadLook`).
     pub fn set_head_yaw(&mut self, id: EntityId, head_yaw: f32) {
         if let Some(entity) = self.entities.get_mut(&id) {
-            entity.target_head_yaw = head_yaw;
+            entity.head_yaw = head_yaw;
         }
     }
 
@@ -175,6 +397,78 @@ impl EntityStore {
         }
     }
 
+    /// Merges a data watcher list into an entity: the visual flags (entry
+    /// 0 and, for players, the skin parts in entry 10) and the typed
+    /// metadata. A health of zero or less starts the death fall, as in
+    /// vanilla (MCP `EntityLivingBase.onUpdate` on a dead entity).
+    ///
+    /// The list holds only the entries that changed; the others keep their
+    /// value.
+    pub fn apply_metadata(&mut self, id: EntityId, metadata: &Metadata) {
+        let Some(entity) = self.entities.get_mut(&id) else {
+            return;
+        };
+        if let Some(flags) = metadata.get_byte(ENTITY_FLAGS) {
+            entity.flags.flags = flags;
+        }
+        if entity.kind == EntityKind::Player {
+            if let Some(parts) = metadata.get_byte(PLAYER_SKIN_PARTS) {
+                entity.flags.skin_parts = parts;
+            }
+        }
+        entity.meta.apply(entity.kind, metadata);
+        // The dragon does not fall: it stays for 200 ticks while it dies
+        // (`EntityDragon.onDeathUpdate` replaces the death of the base class).
+        if entity.kind.is_living()
+            && entity.kind != EntityKind::Dragon
+            && metadata.get_float(LIVING_HEALTH).is_some_and(|h| h <= 0.0)
+        {
+            entity.animation.die();
+        }
+    }
+
+    /// Gives every tracked player with `uuid` a profile (name, skin, cape).
+    ///
+    /// Used when a player spawns before or after its tab list entry.
+    pub fn set_profile(&mut self, uuid: [u8; 16], profile: PlayerProfile) {
+        let profile = Arc::new(profile);
+        for entity in self.entities.values_mut() {
+            if entity.uuid == Some(uuid) {
+                entity.profile = Some(Arc::clone(&profile));
+            }
+        }
+    }
+
+    /// Recomputes the name tag of every player and named mob with `rules`,
+    /// which maps an entity to its tag text (see [`nametag`](super::nametag)).
+    ///
+    /// Called before each frame is published, because teams change at any
+    /// time; the tag text is shared, so an unchanged tag costs nothing.
+    pub fn refresh_name_tags(&mut self, rules: impl Fn(&EntityRecord) -> Option<String>) {
+        for entity in self.entities.values_mut() {
+            let tag = rules(entity);
+            if entity.name_tag.as_deref() != tag.as_deref() {
+                entity.name_tag = tag.map(Arc::from);
+            }
+        }
+    }
+
+    /// Marks which players are in spectator mode, as the tab list says
+    /// (`is_spectator` takes the UUID of a player).
+    pub fn refresh_spectators(&mut self, is_spectator: impl Fn(&[u8; 16]) -> bool) {
+        for entity in self.entities.values_mut() {
+            entity.spectator = entity.uuid.as_ref().is_some_and(&is_spectator);
+        }
+    }
+
+    /// Marks which entities the local player sees as ghosts when they are
+    /// invisible, as their team says (`sees` gets the entity).
+    pub fn refresh_ghosts(&mut self, sees: impl Fn(&EntityRecord) -> bool) {
+        for entity in self.entities.values_mut() {
+            entity.ghost_visible = sees(entity);
+        }
+    }
+
     /// Updates an entity's visual flags.
     pub fn set_flags(&mut self, id: EntityId, flags: EntityFlags) {
         if let Some(entity) = self.entities.get_mut(&id) {
@@ -182,94 +476,215 @@ impl EntityStore {
         }
     }
 
-    /// Updates an entity's held item.
-    pub fn set_held_item(&mut self, id: EntityId, held_item: Option<u16>) {
+    /// Updates a piece of worn armour: `slot` is the `Entity Equipment` slot
+    /// (1 boots to 4 helmet); other slots are ignored.
+    pub fn set_armor(&mut self, id: EntityId, slot: i16, item: Option<EntityItem>) {
+        let Some(index) = usize::try_from(slot - 1).ok().filter(|&i| i < 4) else {
+            return;
+        };
         if let Some(entity) = self.entities.get_mut(&id) {
-            entity.held_item = held_item;
+            entity.armor[index] = item;
         }
     }
 
-    /// Advances the simulation by one tick (20 Hz).
-    ///
-    /// Position and rotation glide toward the server target over 3 ticks,
-    /// matching vanilla `EntityLivingBase.onLivingUpdate`.
-    pub fn tick(&mut self) {
-        for entity in self.entities.values_mut() {
-            entity.previous_position = entity.position;
-            entity.previous_yaw = entity.yaw;
-            entity.previous_pitch = entity.pitch;
-            entity.previous_head_yaw = entity.head_yaw;
-
-            if entity.interpolation_steps > 0 {
-                let steps = f64::from(entity.interpolation_steps);
-                entity.position += (entity.target_position - entity.position) / steps;
-
-                let yaw_diff = wrap_degrees(entity.target_yaw - entity.yaw);
-                entity.yaw += yaw_diff / steps as f32;
-
-                entity.pitch += (entity.target_pitch - entity.pitch) / steps as f32;
-
-                let head_diff = wrap_degrees(entity.target_head_yaw - entity.head_yaw);
-                entity.head_yaw += head_diff / steps as f32;
-
-                entity.interpolation_steps -= 1;
-            }
-
-            let dx = entity.position.x - entity.previous_position.x;
-            let dz = entity.position.z - entity.previous_position.z;
-            let speed = (dx * dx + dz * dz).sqrt() as f32;
-
-            entity.previous_limb_swing_amount = entity.limb_swing_amount;
-            entity.limb_swing += speed * 4.0;
-            let target_amount = (speed * 4.0).clamp(0.0, 1.0);
-            entity.limb_swing_amount += (target_amount - entity.limb_swing_amount) * 0.4;
+    /// Updates the stack an entity holds in its hand.
+    pub fn set_held(&mut self, id: EntityId, held: Option<EntityItem>) {
+        if let Some(entity) = self.entities.get_mut(&id) {
+            entity.held = held;
+            // MCP `EntityOtherPlayerMP.onUpdate`: a use of another item
+            // starts over.
+            entity.use_ticks = 0;
         }
+    }
+
+    /// Sets the dropped stack of an item entity or the stack inside a frame.
+    pub fn set_item(&mut self, id: EntityId, item: Option<EntityItem>) {
+        if let Some(entity) = self.entities.get_mut(&id) {
+            entity.item = item;
+        }
+    }
+
+    /// Sets the rotation step of the item inside a frame (masked to `0..=7`).
+    pub fn set_frame_rotation(&mut self, id: EntityId, rotation: u8) {
+        if let Some(entity) = self.entities.get_mut(&id) {
+            entity.frame_rotation = rotation & 7;
+        }
+    }
+
+    /// Sets an entity's health (from data watcher index 6).
+    pub fn set_health(&mut self, id: EntityId, health: f32) {
+        if let Some(entity) = self.entities.get_mut(&id) {
+            entity.health = Some(health);
+        }
+    }
+
+    /// Borrows the tracked entity records.
+    #[must_use]
+    pub fn entities(&self) -> &BTreeMap<EntityId, EntityRecord> {
+        &self.entities
+    }
+
+    /// Applies an `Entity Status` that animates: `2` hurts (and makes the
+    /// legs jolt, MCP `handleStatusUpdate`), `3` kills. Other codes are not
+    /// animations and are ignored.
+    pub fn status(&mut self, id: EntityId, status: i8) {
+        let Some(entity) = self.entities.get_mut(&id) else {
+            return;
+        };
+        match status {
+            2 => {
+                entity.limbs.amount = HURT_LIMB_AMOUNT;
+                entity.animation.hurt_by_status();
+            }
+            3 if entity.kind != EntityKind::Dragon => entity.animation.die(),
+            // MCP `EntitySquid.handleStatusUpdate`: the swim cycle restarts.
+            19 if entity.kind == EntityKind::Squid => entity.animation.restart_squid_cycle(),
+            // MCP `EntityPlayer.handleStatusUpdate`: the item use finished.
+            9 => entity.use_ticks = 0,
+            _ => {}
+        }
+    }
+
+    /// Applies an `Animation` packet: `0` swings the arm, `1` hurts, `2`
+    /// wakes a sleeper. The critical-hit particles (`4`, `5`) belong to the
+    /// particle system.
+    pub fn play_animation(&mut self, id: EntityId, animation: u8) {
+        let Some(entity) = self.entities.get_mut(&id) else {
+            return;
+        };
+        match animation {
+            0 => entity.animation.swing_item(),
+            1 => entity.animation.hurt(),
+            2 => entity.animation.bed = None,
+            _ => {}
+        }
+    }
+
+    /// Puts a player to bed (`Use Bed`): the player lies at the head end of
+    /// the bed block at `bed`, whose head points towards `facing`
+    /// (`0` south, `1` west, `2` north, `3` east).
+    pub fn sleep(&mut self, id: EntityId, bed: DVec3, facing: u8) {
+        if let Some(entity) = self.entities.get_mut(&id) {
+            let pose = BedPose::from_facing(facing);
+            let position = bed + pose.head_offset.as_dvec3();
+            entity.position = position;
+            entity.previous_position = position;
+            entity.target_position = position;
+            entity.animation.bed = Some(pose);
+        }
+    }
+
+    /// Advances the simulation by one tick (20 Hz): glide to the server
+    /// position, then animate limbs and body (MCP `EntityLivingBase.onUpdate`).
+    pub fn tick(&mut self) {
+        // MCP `Entity.onEntityUpdate`: below y = -64 an entity kills itself. On the
+        // client that removes an object (`Entity.kill` is `setDead`); a living one
+        // only asks for damage, which the client does not deal. A server that
+        // checks the client counts on it: it sinks the item the player sits on and
+        // waits for the player, let go below the world, to report its position.
+        let fallen: Vec<i32> = self
+            .entities
+            .values()
+            .filter(|entity| !entity.kind.is_living() && entity.position.y < VOID_Y)
+            .map(|entity| entity.id.0)
+            .collect();
+        if !fallen.is_empty() {
+            self.destroy(&fallen);
+        }
+        for entity in self.entities.values_mut() {
+            entity.begin_tick();
+            entity.glide_to_target();
+            entity.animate();
+            entity.animation.tick();
+            if let Variant::Creeper(creeper) = &entity.meta.variant {
+                // A lit creeper fuses whatever its state says.
+                let state = if creeper.ignited { 1 } else { creeper.state };
+                entity.animation.tick_fuse(state);
+            }
+            if entity.kind == EntityKind::Squid {
+                entity.animation.tick_squid(entity.velocity, entity.id.0);
+            }
+            entity.tick_use();
+            entity.meta.tick();
+            entity.age_ticks = entity.age_ticks.saturating_add(1);
+        }
+        // `World.updateEntities`: a rider whose vehicle is gone is let go.
+        let orphans: Vec<EntityId> = self
+            .entities
+            .iter()
+            .filter(|(_, rider)| {
+                rider
+                    .vehicle
+                    .is_some_and(|vehicle| !self.entities.contains_key(&vehicle))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in orphans {
+            if let Some(rider) = self.entities.get_mut(&id) {
+                rider.vehicle = None;
+            }
+        }
+        // MCP `Entity.updateRidden`: a rider is put at the seat of its vehicle.
+        let seats: Vec<(EntityId, DVec3)> = self
+            .entities
+            .iter()
+            .filter_map(|(id, rider)| {
+                let vehicle = self.entities.get(&rider.vehicle?)?;
+                Some((*id, crate::riding::rider_position(vehicle, rider)))
+            })
+            .collect();
+        for (id, feet) in seats {
+            if let Some(rider) = self.entities.get_mut(&id) {
+                rider.position = feet;
+            }
+        }
+        for entity in self.entities.values_mut() {
+            if let Some(flight) = entity.collecting.as_mut() {
+                flight.ticks += 1;
+                let fraction =
+                    (f64::from(flight.ticks) / f64::from(super::record::Collecting::TICKS)).powi(2);
+                entity.position = flight.start.lerp(flight.target, fraction);
+            }
+        }
+        self.entities.retain(|_, entity| {
+            entity
+                .collecting
+                .is_none_or(|flight| flight.ticks < super::record::Collecting::TICKS)
+        });
+        self.entities
+            .retain(|_, entity| !entity.animation.is_finished());
+    }
+
+    /// Advances the objects the client simulates (dropped items, falling
+    /// blocks, arrows, projectiles) by one tick, with the collisions of `world`.
+    /// Call it right after [`Self::tick`].
+    pub fn tick_objects<S: crate::shapes::BlockSource + ?Sized>(&mut self, world: &S) {
+        for entity in self.entities.values_mut() {
+            // `World.updateEntities` skips a rider: its vehicle puts it at the
+            // seat, so an item on a hologram mount does not fall.
+            if entity.collecting.is_none() && entity.vehicle.is_none() {
+                super::objects::step(entity, world);
+            }
+        }
+        // `EntityLightningBolt.onUpdate`: the bolt flashes one to three times
+        // and dies; the number of ticks it takes is random, so it is spread
+        // over the id here.
+        self.entities.retain(|id, entity| {
+            entity.kind != EntityKind::Lightning
+                || entity.age_ticks <= LIGHTNING_FLASH_TICKS * (3 + id.0.rem_euclid(3) as u32)
+        });
     }
 
     /// Produces interpolated render snapshots for all tracked entities.
     ///
-    /// `alpha` is the partial tick fraction in `0.0..=1.0`.
+    /// `alpha` is the partial tick fraction in `0.0..=1.0`. Positions are in
+    /// world coordinates (the render thread interpolates the frame data
+    /// itself, relative to its render origin).
     #[must_use]
     pub fn snapshots(&self, alpha: f32) -> Vec<EntityRenderSnapshot> {
-        let alpha_d = f64::from(alpha.clamp(0.0, 1.0));
-        let alpha_f = alpha.clamp(0.0, 1.0);
-
         self.entities
             .values()
-            .map(|entity| {
-                let interpolated_pos = entity.previous_position.lerp(entity.position, alpha_d);
-                let position = Vec3::new(
-                    interpolated_pos.x as f32,
-                    interpolated_pos.y as f32,
-                    interpolated_pos.z as f32,
-                );
-
-                let yaw = interpolate_angle(entity.previous_yaw, entity.yaw, alpha_f);
-                let pitch =
-                    entity.previous_pitch + (entity.pitch - entity.previous_pitch) * alpha_f;
-                let head_yaw =
-                    interpolate_angle(entity.previous_head_yaw, entity.head_yaw, alpha_f);
-
-                let limb_swing_amount = entity.previous_limb_swing_amount
-                    + (entity.limb_swing_amount - entity.previous_limb_swing_amount) * alpha_f;
-
-                // Vanilla: limbSwing - limbSwingAmount * (1.0 - partialTicks)
-                let limb_swing = entity.limb_swing - entity.limb_swing_amount * (1.0 - alpha_f);
-
-                EntityRenderSnapshot {
-                    id: entity.id,
-                    kind: entity.kind,
-                    position,
-                    yaw,
-                    pitch,
-                    head_yaw,
-                    limb_swing,
-                    limb_swing_amount,
-                    uuid: entity.uuid,
-                    held_item: entity.held_item,
-                    flags: entity.flags,
-                }
-            })
+            .map(|entity| entity.frame_data().interpolate(alpha, DVec3::ZERO))
             .collect()
     }
 
@@ -280,61 +695,326 @@ impl EntityStore {
     /// fraction without pre-baking the alpha on the game thread.
     #[must_use]
     pub fn frame_data(&self) -> Vec<EntityFrameData> {
-        self.entities
+        let mut frames: Vec<EntityFrameData> = self
+            .entities
             .values()
-            .map(|e| {
-                let prev_position = Vec3::new(
-                    e.previous_position.x as f32,
-                    e.previous_position.y as f32,
-                    e.previous_position.z as f32,
-                );
-                let position = Vec3::new(
-                    e.position.x as f32,
-                    e.position.y as f32,
-                    e.position.z as f32,
-                );
-                EntityFrameData {
-                    id: e.id,
-                    kind: e.kind,
-                    prev_position,
-                    position,
-                    prev_yaw: e.previous_yaw,
-                    yaw: e.yaw,
-                    prev_pitch: e.previous_pitch,
-                    pitch: e.pitch,
-                    prev_head_yaw: e.previous_head_yaw,
-                    head_yaw: e.head_yaw,
-                    limb_swing: e.limb_swing,
-                    prev_limb_swing_amount: e.previous_limb_swing_amount,
-                    limb_swing_amount: e.limb_swing_amount,
-                    uuid: e.uuid,
-                    held_item: e.held_item,
-                    flags: e.flags,
-                }
-            })
-            .collect()
+            .map(EntityRecord::frame_data)
+            .collect();
+        let rided: Vec<EntityId> = self
+            .entities
+            .values()
+            .filter_map(|entity| entity.vehicle)
+            .collect();
+        for frame in &mut frames {
+            frame.ridden = rided.contains(&frame.id);
+        }
+        frames
     }
-}
-
-/// Wraps a degree difference into `(-180, 180]`.
-fn wrap_degrees(d: f32) -> f32 {
-    let mut r = d % 360.0;
-    if r < -180.0 {
-        r += 360.0;
-    } else if r >= 180.0 {
-        r -= 360.0;
-    }
-    r
-}
-
-/// Interpolates between two angles in degrees taking the shortest arc.
-fn interpolate_angle(prev: f32, current: f32, alpha: f32) -> f32 {
-    prev + wrap_degrees(current - prev) * alpha
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sword() -> EntityItem {
+        EntityItem {
+            item_id: 276,
+            damage: 0,
+            count: 1,
+            nbt: None,
+        }
+    }
+
+    #[test]
+    fn a_collected_item_flies_to_the_collector_and_goes() {
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 2, 0);
+        store.collect(EntityId(1), EntityId(99), DVec3::new(0.0, 0.0, 9.0));
+        // After one tick it has covered (1/3)^2 of the way to half a block over
+        // the collector; after the third it is gone.
+        store.tick();
+        let at = store.snapshots(1.0)[0].position;
+        assert!(
+            (at - glam::Vec3::new(0.0, 0.5 / 9.0, 1.0)).length() < 1e-4,
+            "{at}"
+        );
+        store.tick();
+        store.tick();
+        assert!(store.snapshots(1.0).is_empty());
+    }
+
+    #[test]
+    fn a_rider_follows_the_seat_of_its_vehicle() {
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 1, 0);
+        store.spawn_mob(
+            EntityId(2),
+            90,
+            DVec3::new(5.0, 70.0, 5.0),
+            0.0,
+            0.0,
+            0.0,
+            Vec3::ZERO,
+            crate::entity::EntityFlags::default(),
+        );
+        store.attach(EntityId(2), Some(EntityId(1)));
+        store.tick();
+        let snaps = store.snapshots(1.0);
+        let rider = snaps.iter().find(|s| s.id == EntityId(2)).unwrap();
+        assert!(rider.riding);
+        // A boat at the origin seats the rider 0.4 along its yaw and 0.3 down
+        // (a pig has no `getYOffset` of its own, a player would sit 0.35 lower).
+        assert!((rider.position - glam::Vec3::new(0.4, -0.3, 0.0)).length() < 1e-4);
+        store.attach(EntityId(2), None);
+        store.tick();
+        assert!(!store.snapshots(1.0).iter().any(|s| s.riding));
+    }
+
+    #[test]
+    fn an_item_on_a_hologram_mount_stays_put_instead_of_falling() {
+        struct Air;
+        impl crate::shapes::BlockSource for Air {
+            fn block(&self, _x: i32, _y: i32, _z: i32) -> umicraft_world::BlockState {
+                umicraft_world::BlockState::AIR
+            }
+        }
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 66, 0);
+        spawn_object_at_origin(&mut store, 2, 2, 0);
+        store.attach(EntityId(2), Some(EntityId(1)));
+        for _ in 0..20 {
+            store.tick();
+            store.tick_objects(&Air);
+        }
+        let snaps = store.snapshots(1.0);
+        let item = snaps.iter().find(|s| s.id == EntityId(2)).unwrap();
+        assert!(
+            (item.position.y - 0.3125 * 0.75).abs() < 1e-4,
+            "the item fell to {}",
+            item.position.y
+        );
+        // Taken off its mount, it falls again.
+        store.attach(EntityId(2), None);
+        for _ in 0..20 {
+            store.tick();
+            store.tick_objects(&Air);
+        }
+        let snaps = store.snapshots(1.0);
+        let item = snaps.iter().find(|s| s.id == EntityId(2)).unwrap();
+        assert!(item.position.y < 0.0, "free again: {}", item.position.y);
+    }
+
+    /// A wither skull with an item on it, as a hologram item line.
+    fn item_on_a_skull() -> EntityStore {
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 66, 0);
+        spawn_object_at_origin(&mut store, 2, 2, 0);
+        store.attach(EntityId(2), Some(EntityId(1)));
+        store.tick();
+        store
+    }
+
+    struct Air;
+    impl crate::shapes::BlockSource for Air {
+        fn block(&self, _x: i32, _y: i32, _z: i32) -> umicraft_world::BlockState {
+            umicraft_world::BlockState::AIR
+        }
+    }
+
+    #[test]
+    fn leaving_a_mount_puts_the_rider_over_it() {
+        // `Entity.mountEntity(null)`: on top of the vehicle's hitbox, with no
+        // glide from the old seat.
+        let mut store = item_on_a_skull();
+        store.attach(EntityId(2), None);
+        let item = &store.entities[&EntityId(2)];
+        assert_eq!(item.vehicle, None);
+        assert!(
+            (item.position.y - 0.3125).abs() < 1e-9,
+            "{}",
+            item.position.y
+        );
+        assert_eq!(item.previous_position, item.position);
+        assert_eq!(item.target_position, item.position);
+    }
+
+    #[test]
+    fn destroying_the_vehicle_lets_its_rider_go_and_fall() {
+        let mut store = item_on_a_skull();
+        store.destroy(&[1]);
+        assert_eq!(store.entities[&EntityId(2)].vehicle, None);
+        for _ in 0..10 {
+            store.tick();
+            store.tick_objects(&Air);
+        }
+        let y = store.entities[&EntityId(2)].position.y;
+        assert!(y < 0.3125 - 0.1, "the item falls from the skull top: {y}");
+    }
+
+    #[test]
+    fn attach_follows_handle_entity_attach_for_unknown_entities() {
+        // An unknown rider is ignored.
+        let mut store = item_on_a_skull();
+        store.attach(EntityId(99), Some(EntityId(1)));
+        assert!(!store.entities.contains_key(&EntityId(99)));
+        // An unknown vehicle is `mountEntity(null)`: the item steps off.
+        store.attach(EntityId(2), Some(EntityId(98)));
+        assert_eq!(store.entities[&EntityId(2)].vehicle, None);
+    }
+
+    #[test]
+    fn a_mount_that_seats_the_vehicle_on_its_rider_is_refused() {
+        let mut store = EntityStore::new();
+        for id in 1..=3 {
+            spawn_object_at_origin(&mut store, id, 66, 0);
+        }
+        store.attach(EntityId(2), Some(EntityId(1)));
+        store.attach(EntityId(3), Some(EntityId(2)));
+        // 1 on 3 would close the loop 1 -> 3 -> 2 -> 1.
+        store.attach(EntityId(1), Some(EntityId(3)));
+        assert_eq!(store.entities[&EntityId(1)].vehicle, None);
+        assert_eq!(store.entities[&EntityId(3)].vehicle, Some(EntityId(2)));
+    }
+
+    #[test]
+    fn a_lightning_bolt_flashes_for_a_while_and_goes() {
+        struct Air;
+        impl crate::shapes::BlockSource for Air {
+            fn block(&self, _x: i32, _y: i32, _z: i32) -> umicraft_world::BlockState {
+                umicraft_world::BlockState::AIR
+            }
+        }
+        let mut store = EntityStore::new();
+        assert!(!store.lightning_flashing());
+        store.spawn_lightning(EntityId(4), DVec3::new(1.0, 64.0, 1.0));
+        assert!(store.lightning_flashing());
+        for _ in 0..LIGHTNING_FLASH_TICKS * 3 {
+            store.tick();
+            store.tick_objects(&Air);
+        }
+        assert_eq!(store.snapshots(0.0).len(), 1, "still flashing");
+        for _ in 0..LIGHTNING_FLASH_TICKS * 3 {
+            store.tick();
+            store.tick_objects(&Air);
+        }
+        assert!(store.snapshots(0.0).is_empty(), "gone");
+        assert!(!store.lightning_flashing());
+    }
+
+    fn spawn_object_at_origin(store: &mut EntityStore, id: i32, object_type: u8, data: i32) {
+        store.spawn_object(
+            EntityId(id),
+            object_type,
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            Vec3::ZERO,
+            data,
+        );
+    }
+
+    #[test]
+    fn an_item_frame_keeps_its_wall_direction() {
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 71, 3);
+        spawn_object_at_origin(&mut store, 2, 71, 9);
+        spawn_object_at_origin(&mut store, 3, 2, 3);
+        let snaps = store.snapshots(0.0);
+        assert_eq!(snaps[0].kind, EntityKind::ItemFrame);
+        assert_eq!(snaps[0].frame_direction, 3);
+        assert_eq!(
+            snaps[1].frame_direction, 3,
+            "clamped to the horizontal range"
+        );
+        assert_eq!(snaps[2].frame_direction, 0, "only frames use the data");
+    }
+
+    #[test]
+    fn items_and_frame_rotations_reach_the_snapshot() {
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 71, 0);
+        store.set_item(EntityId(1), Some(sword()));
+        store.set_frame_rotation(EntityId(1), 11);
+        let snap = &store.snapshots(0.0)[0];
+        assert_eq!(snap.item, Some(sword()));
+        assert_eq!(snap.frame_rotation, 3, "masked to 0..=7");
+
+        store.set_item(EntityId(1), None);
+        assert_eq!(store.snapshots(0.0)[0].item, None);
+    }
+
+    #[test]
+    fn the_age_grows_with_ticks_and_the_alpha() {
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 2, 0);
+        assert!(store.snapshots(0.25)[0].age - 0.25 < 1e-6);
+        store.tick();
+        store.tick();
+        assert!((store.snapshots(0.5)[0].age - 2.5).abs() < 1e-6);
+        let from_frame = store.frame_data()[0].interpolate(0.5, DVec3::ZERO);
+        assert!((from_frame.age - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_age_saturates() {
+        let mut store = EntityStore::new();
+        spawn_object_at_origin(&mut store, 1, 2, 0);
+        store
+            .entities
+            .get_mut(&EntityId(1))
+            .expect("tracked")
+            .age_ticks = u32::MAX;
+        store.tick();
+        assert_eq!(store.entities[&EntityId(1)].age_ticks, u32::MAX);
+    }
+
+    #[test]
+    fn equipment_slots_one_to_four_fill_the_armor_boots_first() {
+        let mut store = EntityStore::new();
+        let id = EntityId(10);
+        store.spawn_player(
+            id,
+            [1u8; 16],
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            None,
+            EntityFlags::default(),
+        );
+        store.set_armor(id, 4, Some(sword()));
+        store.set_armor(id, 1, Some(sword()));
+        store.set_armor(id, 5, Some(sword()));
+        store.set_armor(id, 0, Some(sword()));
+        let armor = &store.snapshots(0.0)[0].armor;
+        assert!(armor[0].is_some() && armor[3].is_some());
+        assert!(
+            armor[1].is_none() && armor[2].is_none(),
+            "slots 0 and 5 are not armour"
+        );
+        store.set_armor(id, 4, None);
+        assert!(store.snapshots(0.0)[0].armor[3].is_none());
+    }
+
+    #[test]
+    fn the_tab_list_decides_which_players_are_spectators() {
+        let mut store = EntityStore::new();
+        for (id, uuid) in [(1, [1u8; 16]), (2, [2u8; 16])] {
+            store.spawn_player(
+                EntityId(id),
+                uuid,
+                DVec3::ZERO,
+                0.0,
+                0.0,
+                None,
+                EntityFlags::default(),
+            );
+        }
+        store.refresh_spectators(|uuid| uuid[0] == 2);
+        let flags: Vec<bool> = store.snapshots(0.0).iter().map(|s| s.spectator).collect();
+        assert_eq!(flags.iter().filter(|&&spectator| spectator).count(), 1);
+        store.refresh_spectators(|_| false);
+        assert!(store.snapshots(0.0).iter().all(|s| !s.spectator));
+    }
 
     #[test]
     fn spawn_and_destroy_flow() {
@@ -348,7 +1028,7 @@ mod tests {
             DVec3::new(10.0, 64.0, 20.0),
             90.0,
             0.0,
-            Some(276), // diamond sword
+            Some(sword()), // diamond sword
             EntityFlags::default(),
         );
 
@@ -356,7 +1036,7 @@ mod tests {
         let snapshots = store.snapshots(0.5);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, player_id);
-        assert_eq!(snapshots[0].held_item, Some(276));
+        assert_eq!(snapshots[0].held, Some(sword()));
 
         store.destroy(&[10]);
         assert!(store.is_empty());
@@ -428,5 +1108,283 @@ mod tests {
         // After tick 1: prev=0.0, current=1.0 → alpha 0.5 gives 0.5
         let mid = store.snapshots(0.5);
         assert!((mid[0].position.x - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_camera_view_sits_at_the_eyes_of_the_entity() {
+        let mut store = EntityStore::new();
+        let id = EntityId(5);
+        store.spawn_player(
+            id,
+            [2u8; 16],
+            DVec3::new(1.0, 64.0, 2.0),
+            90.0,
+            45.0,
+            None,
+            EntityFlags::default(),
+        );
+        let view = store.camera_view(id, 1.0).expect("tracked entity");
+        assert!((view.position.y - 65.62).abs() < 1e-4);
+        assert!((view.position.x - 1.0).abs() < 1e-4);
+        assert!((view.pitch - 45f32.to_radians()).abs() < 1e-4);
+    }
+
+    fn zombie(store: &mut EntityStore) -> EntityId {
+        let id = EntityId(30);
+        store.spawn_mob(
+            id,
+            54,
+            DVec3::new(0.0, 64.0, 0.0),
+            0.0,
+            0.0,
+            0.0,
+            Vec3::ZERO,
+            EntityFlags::default(),
+        );
+        id
+    }
+
+    #[test]
+    fn a_teleport_is_interpolated_instead_of_snapping() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.teleport(id, DVec3::new(6.0, 64.0, 0.0), 0.0, 0.0, true);
+        assert_eq!(store.snapshots(1.0)[0].position.x, 0.0);
+        store.tick();
+        assert!((store.snapshots(1.0)[0].position.x - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_head_look_applies_at_once() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.set_head_yaw(id, 50.0);
+        assert_eq!(store.snapshots(1.0)[0].head_yaw, 50.0);
+    }
+
+    #[test]
+    fn a_relative_move_stops_a_turn_in_progress() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.look(id, 90.0, 0.0, true);
+        store.tick();
+        let turned = store.snapshots(1.0)[0].yaw;
+        store.move_relative(id, DVec3::ZERO, true);
+        store.tick();
+        store.tick();
+        assert!((store.snapshots(1.0)[0].yaw - turned).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_walking_mob_swings_its_limbs_in_the_snapshot() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.move_relative(id, DVec3::new(0.6, 0.0, 0.0), true);
+        store.tick();
+        let snapshot = &store.snapshots(1.0)[0];
+        assert!(snapshot.limb_swing_amount > 0.0);
+        assert!(snapshot.limb_swing > 0.0);
+    }
+
+    #[test]
+    fn a_hurt_status_flashes_the_entity_and_jolts_its_legs() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.status(id, 2);
+        let snapshot = &store.snapshots(1.0)[0];
+        assert!(snapshot.hurt);
+        assert_eq!(snapshot.limb_swing_amount, 1.5);
+        for _ in 0..10 {
+            store.tick();
+        }
+        assert!(!store.snapshots(1.0)[0].hurt);
+    }
+
+    #[test]
+    fn a_death_status_removes_the_entity_after_the_fall() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.status(id, 3);
+        store.tick();
+        assert!(store.snapshots(0.0)[0].death_time > 0.0);
+        for _ in 0..19 {
+            store.tick();
+        }
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn other_statuses_do_not_animate() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.status(id, 9);
+        let snapshot = &store.snapshots(1.0)[0];
+        assert!(!snapshot.hurt);
+        assert_eq!(snapshot.death_time, 0.0);
+    }
+
+    #[test]
+    fn an_animation_packet_swings_the_arm() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        store.play_animation(id, 0);
+        store.tick();
+        store.tick();
+        assert!(store.snapshots(1.0)[0].swing_progress > 0.0);
+    }
+
+    #[test]
+    fn a_sleeping_player_lies_in_the_bed_until_woken() {
+        let mut store = EntityStore::new();
+        let id = EntityId(7);
+        store.spawn_player(
+            id,
+            [3u8; 16],
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            None,
+            EntityFlags::default(),
+        );
+        store.sleep(id, DVec3::new(10.0, 64.0, 20.0), 0);
+        let asleep = &store.snapshots(1.0)[0];
+        assert_eq!(asleep.bed.map(|bed| bed.orientation), Some(90.0));
+        assert!((asleep.position.y - 64.6875).abs() < 1e-4);
+        assert!((asleep.position.z - 20.9).abs() < 1e-4);
+        store.play_animation(id, 2);
+        assert!(store.snapshots(1.0)[0].bed.is_none());
+    }
+
+    fn watched(
+        index: u8,
+        type_id: u8,
+        value: Vec<u8>,
+    ) -> umicraft_protocol::packets::play::metadata::WatchedObject {
+        umicraft_protocol::packets::play::metadata::WatchedObject {
+            type_id,
+            index,
+            value,
+        }
+    }
+
+    #[test]
+    fn a_partial_metadata_update_keeps_the_other_flags() {
+        let mut store = EntityStore::new();
+        let id = EntityId(8);
+        store.spawn_player(
+            id,
+            [4u8; 16],
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            None,
+            EntityFlags::new(0x02, 0x7F),
+        );
+        // Only the health changes: the sneak flag and the skin parts stay.
+        let update = Metadata {
+            objects: vec![watched(6, 3, 10.0f32.to_be_bytes().to_vec())],
+        };
+        store.apply_metadata(id, &update);
+        let snapshot = &store.snapshots(1.0)[0];
+        assert!(snapshot.flags.is_sneaking());
+        assert_eq!(snapshot.flags.skin_parts, 0x7F);
+        assert_eq!(snapshot.meta.living.health, 10.0);
+    }
+
+    #[test]
+    fn zero_health_in_the_metadata_kills_the_entity() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        let update = Metadata {
+            objects: vec![watched(6, 3, 0.0f32.to_be_bytes().to_vec())],
+        };
+        store.apply_metadata(id, &update);
+        store.tick();
+        assert!(store.snapshots(0.0)[0].death_time > 0.0);
+    }
+
+    #[test]
+    fn the_skin_parts_entry_of_a_non_player_is_not_a_skin() {
+        let mut store = EntityStore::new();
+        let id = zombie(&mut store);
+        let update = Metadata {
+            objects: vec![watched(10, 0, vec![0x7F])],
+        };
+        store.apply_metadata(id, &update);
+        assert_eq!(store.snapshots(0.0)[0].flags.skin_parts, 0);
+    }
+
+    #[test]
+    fn a_profile_reaches_the_players_with_its_uuid_only() {
+        let mut store = EntityStore::new();
+        for (id, uuid) in [(1, [1u8; 16]), (2, [2u8; 16])] {
+            store.spawn_player(
+                EntityId(id),
+                uuid,
+                DVec3::ZERO,
+                0.0,
+                0.0,
+                None,
+                EntityFlags::default(),
+            );
+        }
+        store.set_profile([2u8; 16], PlayerProfile::named("Alex"));
+        let snapshots = store.snapshots(1.0);
+        assert!(snapshots[0].profile.is_none());
+        assert_eq!(
+            snapshots[1].profile.as_ref().map(|p| &*p.name),
+            Some("Alex")
+        );
+    }
+
+    #[test]
+    fn the_camera_view_of_an_unknown_entity_is_none() {
+        assert!(EntityStore::new().camera_view(EntityId(9), 1.0).is_none());
+    }
+
+    #[test]
+    fn the_use_of_the_held_item_is_counted_while_the_flag_is_set() {
+        let mut store = EntityStore::new();
+        let id = EntityId(3);
+        store.spawn_player(
+            id,
+            [3; 16],
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            Some(sword()),
+            EntityFlags::default(),
+        );
+        store.tick();
+        assert_eq!(store.snapshots(1.0)[0].use_ticks, 0);
+        store.set_flags(id, EntityFlags::new(0x10, 0));
+        (0..5).for_each(|_| store.tick());
+        assert_eq!(store.snapshots(1.0)[0].use_ticks, 5);
+        store.status(id, 9);
+        assert_eq!(store.snapshots(1.0)[0].use_ticks, 0);
+        store.tick();
+        store.set_flags(id, EntityFlags::default());
+        store.tick();
+        assert_eq!(store.snapshots(1.0)[0].use_ticks, 0);
+    }
+
+    #[test]
+    fn a_bobber_marks_its_angler_until_it_is_destroyed() {
+        let mut store = EntityStore::new();
+        store.spawn_player(
+            EntityId(3),
+            [3; 16],
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            None,
+            EntityFlags::default(),
+        );
+        let fishing = |store: &EntityStore| store.snapshots(1.0)[0].fishing;
+        assert!(!fishing(&store));
+        spawn_object_at_origin(&mut store, 40, 90, 3);
+        assert!(fishing(&store));
+        store.destroy(&[40]);
+        assert!(!fishing(&store));
     }
 }

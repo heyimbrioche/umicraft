@@ -12,30 +12,75 @@
 //! pure `umicraft-ui` crate; this crate only uploads its [`ui_pass::UiPass`]
 //! vertices and font atlas.
 
+mod adapter;
+mod batch_buffer;
 mod block_atlas;
+mod border;
 mod camera;
+mod capture;
+mod cave_graph;
+mod chunk_pass;
+mod clouds;
+mod dynamic_blocks;
 pub mod entity_pass;
 mod environment;
 mod error;
+mod fog;
 mod font;
-mod hud;
+mod gpu_timer;
+mod hires_blocks;
+pub mod hud;
+pub mod hud_hearts;
+mod items;
+mod lightmap;
+mod mipmap;
+mod motion_blur;
+mod nametag;
+mod outline;
 mod overlay;
+mod overlays;
+mod panorama;
+mod particles;
 mod renderer;
+mod scene_blur;
 mod sky;
 mod texture;
 mod ui_pass;
+mod weather;
 
+pub use adapter::AdapterSummary;
 pub use block_atlas::BlockAtlasError;
-pub use camera::Camera;
+pub use border::{BorderStatus, BorderView};
+pub use camera::{Camera, Frustum};
+pub use clouds::CloudMode;
 pub use entity_pass::{EntityBatch, EntityRenderer, EntityTexture, EntityVertex};
 pub use environment::RenderEnvironment;
 pub use error::RenderError;
+pub use fog::{light_brightness, FogContext, FogMedium, FogMode, FogParams};
+pub use gpu_timer::{GpuTimings, GROUP_NAMES};
 pub use hud::{
-    draw as draw_hud, selected_index, status_fills, Fill, HudLayout, HudState, ItemStack, Rect,
-    StatusRow,
+    chat_run_at, draw_hud_gui, measure_mod_widget, HudSheets, ModLine, ModWidgetView, ShadowStyle,
+    WidgetStyle,
 };
+pub use hud::{
+    plain_text, ActionBarView, BossView, ChatInputView, ChatLineView, ChatRunView, ChatStyle,
+    DebugF3View, HudState, SidebarLineView, SidebarView, TabEntryView, TabListView, TabValueStyle,
+    TitleView,
+};
+pub use hud_hearts::{HeartsTint, HeartsView};
+pub use items::{
+    IconProvider, NoIcons, ICON_ATLAS_SIZE, ICON_CELL_SIZE, PORTRAIT_KEY, PORTRAIT_SIZE,
+};
+pub use motion_blur::{MotionBlurSettings, MotionBlurVersion};
+pub use nametag::Nametag;
+pub use outline::{edge_vertices, OutlineBox, OUTLINE_GROWTH};
 pub use overlay::{Overlay, OverlayVertex};
+pub use overlays::{Portal, ScreenOverlays, Underwater};
+pub use particles::{ParticleSprite, MAX_SPRITES};
 pub use renderer::{Image, Renderer};
-pub use sky::SkyState;
+pub use sky::{SkyImage, SkyState, SkyTextures};
 pub use texture::{fallback_texture_data, LAYER_BYTES, TEXTURE_SIZE};
-pub use ui_pass::{fallback_atlas, FontAtlasError, UiPass};
+pub use ui_pass::{fallback_atlas, FontAtlasError, UiBatch, UiBatchKind, UiPass};
+pub use umicraft_ui::screens::gui_scale;
+pub use umicraft_ui::SpriteSheet;
+pub use weather::{PrecipitationCell, PrecipitationField, FIELD_RADIUS};

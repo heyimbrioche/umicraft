@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["fuzz"]
 resolver = "2"
 members = [
     "crates/umicraft-core",
@@ -13,6 +14,9 @@ members = [
     "crates/umicraft-assets",
     "crates/umicraft-game",
     "crates/umicraft-ui",
+    "crates/umicraft-audio",
+    "crates/umicraft-auth",
+    "crates/umicraft-builtin-mods",
 ]
 
 [workspace.package]
@@ -25,19 +29,23 @@ license = "MIT OR Apache-2.0"
 aes = "0.8"
 bytemuck = { version = "1", features = ["derive"] }
 flate2 = "1.0"
-num-bigint = "0.4"
-png = "0.17"
+fontdue = "0.9"
+jpeg-decoder = { version = "0.3", default-features = false }
+num-bigint = "0.5"
+png = "0.18"
+proptest = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "system-proxy"] }
 rsa = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha1 = "0.10"
+sha1 = "0.11"
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "tracing-log"] }
 umicraft-assets = { path = "crates/umicraft-assets", version = "0.1.0" }
+umicraft-core = { path = "crates/umicraft-core", version = "0.1.0" }
 umicraft-model = { path = "crates/umicraft-model", version = "0.1.0" }
 umicraft-net = { path = "crates/umicraft-net", version = "0.1.0" }
 umicraft-protocol = { path = "crates/umicraft-protocol", version = "0.1.0" }
@@ -46,6 +54,9 @@ umicraft-mesh = { path = "crates/umicraft-mesh", version = "0.1.0" }
 umicraft-render = { path = "crates/umicraft-render", version = "0.1.0" }
 umicraft-game = { path = "crates/umicraft-game", version = "0.1.0" }
 umicraft-ui = { path = "crates/umicraft-ui", version = "0.1.0" }
+umicraft-audio = { path = "crates/umicraft-audio", version = "0.1.0" }
+umicraft-auth = { path = "crates/umicraft-auth", version = "0.1.0" }
+umicraft-builtin-mods = { path = "crates/umicraft-builtin-mods", version = "0.1.0" }
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -54,3 +65,11 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 chunks_exact_to_as_chunks = "allow"
+
+# The build to hand out: `cargo build --profile dist`. Fat LTO with one codegen unit
+# makes the CPU-bound scene about 6 to 8 % faster (docs/perf-log.md, 2026-11-09) and
+# takes about 4 minutes cold, so day-to-day builds keep the plain `release` profile.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

@@ -3,7 +3,10 @@
 An independent Rust client for Minecraft: Java Edition 1.8.x servers
 (protocol 47). Umicraft is not affiliated with Mojang Studios or Microsoft.
 
-Status: **M8 complete** (Entities, models, skins and rendering).
+Status: the project follows [`ROADMAP.md`](ROADMAP.md) (parity with the vanilla 1.8.8
+client); the current milestone is **P1** (protocol completeness and vanilla traffic). M0–M7 are
+done or nearly so; **M8 (entities) is partial and defective**, see
+[`docs/roadmap-review.md`](docs/roadmap-review.md) §3.3 — its remaining work moves to P5.
 The client logs in offline-mode, decodes chunk/block packets into a compact
 world, runs the player simulation on a game thread, meshes chunks on worker
 threads, and renders them with wgpu either in a window or to an offscreen PNG.
@@ -47,11 +50,30 @@ and lighting, and the server-less `--entity-demo` acceptance path (ADR-0015).
 - An offline-mode 1.8.x server for live testing. The development notes use a
   Paper/PandaSpigot 1.8.8 server on `127.0.0.1:25599` with an FLAT world.
 
+## Download the official assets (first run)
+
+Umicraft ships no Mojang asset. Before the first launch, download and verify
+the official 1.8.8 client jar and assets once (SHA-1 checked, resumable):
+
+```sh
+cargo run --release -p umicraft-client -- --setup-assets
+```
+
+They are stored in the local Umicraft cache and reused on every later run. If
+an official `.minecraft/versions/1.8.8` installation already exists, it is used
+first and this step is not needed. Without assets the client falls back to the
+original procedural textures and font (and `--block-demo` refuses to start).
+
 ## Run the graphical client
 
 ```sh
+cargo run --release -p umicraft-client
 cargo run --release -p umicraft-client -- 127.0.0.1 25599 --name Umicraft --view-distance 8
 ```
+
+Without a host and port the window opens on the title screen: Multiplayer
+lists your saved servers, where you add one, connect and disconnect. With a
+host and port it connects at start.
 
 Always play and measure with `--release`. A debug build compiles the whole
 client, including the zlib decompression of the chunks and the mesher,
@@ -166,6 +188,10 @@ Entities in synthetic scene: 5
 Total vertices: 1656
 Total triangles: 552
 ```
+
+Known gap: the dropped-item cube is counted in the report but the renderer no
+longer draws it (dropped items now go through the P3 item path, which needs a
+registry model rather than the old procedural cube).
 
 Add `--screenshot` to render an offscreen 1280×720 PNG:
 

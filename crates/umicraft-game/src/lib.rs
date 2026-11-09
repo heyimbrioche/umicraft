@@ -31,20 +31,57 @@
 //! The rules are the 1.8 ones and every constant is cited in
 //! `docs/sources.md`; the physics itself is documented in [`physics`], the
 //! collision in [`collision`], the block geometry in [`shapes`], the
-//! reconciliation in [`prediction`] and the block targeting in [`raycast`].
+//! reconciliation in [`prediction`], the block targeting in [`raycast`] and
+//! the gamemodes in [`gamemode`], the block interaction rules in
+//! [`interaction`], the serverbound packets of a tick in [`traffic`] and the protocol state kept
+//! for later milestones (tab list, scoreboard, effects, border, titles) in
+//! [`server`].
 
+pub mod achievements;
+mod block_data;
+pub mod chat;
 pub mod collision;
+pub mod combat;
+pub mod debug_f3;
+pub mod digging;
+pub mod editors;
 pub mod entity;
+pub mod gamemode;
+pub mod hand;
+mod hand_map;
+pub mod hud;
 pub mod input;
+pub mod interaction;
+pub mod inventory;
+pub mod item_nbt;
+pub mod item_use;
+pub mod items;
+pub mod media;
+pub mod movement;
+pub mod nbt;
+pub mod particles;
 pub mod physics;
+pub mod pick;
+pub mod piston;
+mod piston_shape;
+pub mod player_list;
 pub mod prediction;
 pub mod raycast;
+pub mod riding;
+pub mod scoreboard;
+pub mod selection;
+pub mod server;
 pub mod shapes;
+pub mod sound;
+pub mod title;
+pub mod traffic;
+pub mod view;
 
 use glam::{DVec3, Vec3};
 
 pub use entity::{
-    EntityFlags, EntityId, EntityKind, EntityRecord, EntityRenderSnapshot, EntityStore,
+    BossInfo, BossTracker, EntityFlags, EntityId, EntityItem, EntityKind, EntityRecord,
+    EntityRenderSnapshot, EntityStore,
 };
 pub use input::InputIntent;
 pub use physics::Player;
@@ -104,14 +141,28 @@ impl ServerCorrection {
 /// What the renderer needs: plain data, no game types.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderState {
-    /// The eye position in world space.
-    pub position: Vec3,
+    /// The camera position in world space, in f64: the eye in the first person, the
+    /// orbit around it in the third.
+    pub position: DVec3,
+    /// The eye position the third-person camera orbits, equal to `position`
+    /// in the first person. The renderer interpolates it between ticks and
+    /// adds the orbit offset of the newest look, as `EntityRenderer.orientCamera`
+    /// places the camera from the interpolated eye and the current angles.
+    pub eye: DVec3,
+    /// The orbit offset (camera minus eye) the same angles give from the eye
+    /// of the previous tick. The offset from the current eye is
+    /// `position - eye`; the renderer blends the two over the tick, which
+    /// follows the clear distance of the wall rays as `orientCamera` casts
+    /// them every frame from the interpolated eye.
+    pub orbit_start: Vec3,
     /// The horizontal view angle in radians.
     pub yaw: f32,
     /// The vertical view angle in radians.
     pub pitch: f32,
     /// Whether the player rests on the ground.
     pub on_ground: bool,
+    /// The first-person view bobbing and field-of-view modifier.
+    pub effects: view::ViewEffects,
 }
 
 /// The mutable game state owned by the game thread.
@@ -124,6 +175,8 @@ pub struct GameState {
     previous_position: DVec3,
     tick: u64,
     history: PredictionHistory,
+    stepper: sound::step::Stepper,
+    sounds: sound::queue::SoundQueue,
 }
 
 impl GameState {
@@ -135,6 +188,8 @@ impl GameState {
             previous_position: position,
             tick: 0,
             history: PredictionHistory::new(),
+            stepper: sound::step::Stepper::new(),
+            sounds: sound::queue::SoundQueue::new(),
         }
     }
 
@@ -149,9 +204,16 @@ impl GameState {
     ///
     /// The tick allocates nothing: the pending-input history is a fixed
     /// capacity ring buffer and the physics only uses stack values.
+    /// Only a sound cue allocates (its name), once per footstep.
     pub fn tick<S: BlockSource + ?Sized>(&mut self, intent: &InputIntent, world: &S) {
         self.previous_position = self.player.position;
         physics::step(&mut self.player, intent, world);
+        self.sounds.record_steps(
+            &mut self.stepper,
+            &self.player,
+            self.previous_position,
+            world,
+        );
         self.tick += 1;
         self.history.push(PendingTick {
             intent: *intent,
@@ -161,6 +223,49 @@ impl GameState {
             yaw: self.player.yaw,
             pitch: self.player.pitch,
         });
+    }
+
+    /// Takes the sound cues produced since the last call, oldest first.
+    ///
+    /// The cues come from the player's own movement (footsteps, swimming,
+    /// landing), from the digging and rain code that call
+    /// [`GameState::queue_sound_cues`], and from the server's Sound Effect and
+    /// Effect packets. The render thread plays them; the game state does no
+    /// audio I/O. The client calls this once per tick on the game thread and
+    /// forwards the cues to the render thread, which hands them to the audio
+    /// thread (`umicraft-client::audio_bridge`).
+    pub fn drain_sound_cues(&mut self) -> Vec<sound::cue::SoundCue> {
+        self.sounds.drain()
+    }
+
+    /// Queues cues made outside the movement step, such as the break and hit
+    /// sounds of the attack tick or the rain.
+    pub fn queue_sound_cues(&mut self, cues: impl IntoIterator<Item = sound::cue::SoundCue>) {
+        self.sounds.extend(cues);
+    }
+
+    /// Queues the hurt or death sound of the local player for an `Entity
+    /// Status` (2 or 3) addressed to it; other codes are ignored.
+    pub fn on_local_player_status(&mut self, status: i8) {
+        self.sounds
+            .local_player_status(status, self.player.position);
+    }
+
+    /// Queues the cue of a Sound Effect packet.
+    pub fn on_sound_effect(
+        &mut self,
+        packet: &umicraft_protocol::packets::play::clientbound::sound_effect::SoundEffect,
+    ) {
+        self.sounds.sound_effect(packet);
+    }
+
+    /// Queues the cues of an Effect packet (clicks, doors, records, block
+    /// breaks).
+    pub fn on_effect(
+        &mut self,
+        packet: &umicraft_protocol::packets::play::clientbound::effect::Effect,
+    ) {
+        self.sounds.effect(packet);
     }
 
     /// Applies an authoritative server position and replays the pending
@@ -238,6 +343,31 @@ impl GameState {
         }
     }
 
+    /// Teleports the player to a position of `Player Position and Look`.
+    ///
+    /// Vanilla sets the position and the rotation and nothing else: the
+    /// motion is zeroed on the axes that were absolute and kept on the ones
+    /// that were relative (MCP `NetHandlerPlayClient.handlePlayerPosLook`).
+    /// The pending inputs are dropped, unlike [`Self::apply_correction`], which
+    /// replays them: replaying after a setback put the player ahead of the
+    /// server again at once, and an anti-cheat such as GrimAC set the player
+    /// back in a loop (observed 2026-11-02).
+    pub fn teleport(&mut self, target: &ServerCorrection, relative: [bool; 3]) {
+        let position = target.position();
+        let keep = |kept: bool, value: f64| if kept { value } else { 0.0 };
+        self.player.velocity = DVec3::new(
+            keep(relative[0], self.player.velocity.x),
+            keep(relative[1], self.player.velocity.y),
+            keep(relative[2], self.player.velocity.z),
+        );
+        self.player.position = position;
+        self.player.on_ground = target.on_ground;
+        self.player.yaw = target.yaw;
+        self.player.pitch = target.pitch;
+        self.previous_position = position;
+        self.history.clear();
+    }
+
     /// The interpolated view of the player for the renderer.
     ///
     /// `alpha` is the fraction of a tick that elapsed since the last tick:
@@ -251,19 +381,120 @@ impl GameState {
         } else {
             physics::EYE_HEIGHT
         };
+        // Stays f64: the renderer subtracts its origin before any cast (F2-1a).
         let eye = feet + DVec3::Y * eye_height;
         RenderState {
-            position: Vec3::new(eye.x as f32, eye.y as f32, eye.z as f32),
+            position: eye,
+            eye,
+            orbit_start: Vec3::ZERO,
             yaw: self.player.yaw,
             pitch: self.player.pitch,
             on_ground: self.player.on_ground,
+            effects: view::ViewEffects::at(&self.player, alpha as f32),
         }
+    }
+
+    /// Applies the flight abilities the server announced
+    /// (`Player Abilities`, 0x39) and the no-clip flag of the gamemode.
+    pub fn set_abilities(&mut self, allow_flying: bool, flying: bool, fly_speed: f32) {
+        self.player.allow_flying = allow_flying;
+        self.player.flying = flying;
+        self.player.fly_speed = fly_speed;
+    }
+
+    /// Applies the movement stats of the server state (speed attribute, Jump
+    /// Boost, Blindness), the walking speed of the abilities and whether the
+    /// food level allows a sprint.
+    pub fn set_movement(
+        &mut self,
+        stats: movement::MovementStats,
+        walk_speed: f32,
+        well_fed: bool,
+    ) {
+        self.player.movement_speed = stats.speed;
+        self.player.jump_boost = stats.jump_boost;
+        self.player.blinded = stats.blinded;
+        self.player.walk_speed = walk_speed;
+        self.player.well_fed = well_fed;
+    }
+
+    /// Tells how long the bow in use has been drawn (`None` when there is none).
+    pub fn set_bow_draw(&mut self, ticks: Option<u32>) {
+        self.player.bow_draw_ticks = ticks;
+    }
+
+    /// Sets the Depth Strider level of the worn boots.
+    pub fn set_depth_strider(&mut self, level: u8) {
+        self.player.depth_strider = level;
+    }
+
+    /// Replaces the motion of the player (`Entity Velocity`, MCP
+    /// `Entity.setVelocity`).
+    pub fn set_velocity(&mut self, velocity: DVec3) {
+        self.player.velocity = velocity;
+    }
+
+    /// Adds to the motion of the player (the push of an `Explosion`).
+    pub fn add_velocity(&mut self, velocity: DVec3) {
+        self.player.velocity += velocity;
+    }
+
+    /// Lets one moving piston block push the player, if the player is in its
+    /// box (`TileEntityPiston.launchWithSlimeBlock`). `progress` and
+    /// `distance` are the arguments the piston tick hands out, see
+    /// [`piston::motion::tick`].
+    ///
+    /// The previous position is left alone, so the renderer interpolates the
+    /// push over the tick.
+    pub fn launch_by_piston<S: BlockSource + ?Sized>(
+        &mut self,
+        world: &S,
+        block: &piston::MovingBlock,
+        progress: f32,
+        distance: f32,
+    ) {
+        let bounds = self.player.bounding_box();
+        if let Some(push) = piston::push::launch(world, block, progress, distance, &bounds) {
+            piston::push::apply(&mut self.player, push, world);
+        }
+    }
+
+    /// Slows the player and stops its sprint after a hit (MCP
+    /// `EntityPlayer.attackTargetEntityWithCurrentItem`).
+    pub fn reset_sprint(&mut self, reset: combat::SprintReset) {
+        self.player.velocity.x *= reset.scale;
+        self.player.velocity.z *= reset.scale;
+        self.player.set_sprinting(false);
+    }
+
+    /// Puts the player on the seat of its vehicle instead of simulating it.
+    ///
+    /// MCP `EntityPlayerSP.onUpdate` calls `Entity.updateRidden` while the
+    /// player rides: the motion is cleared and the vehicle sets the position.
+    /// The prediction history is dropped, the server never corrects a rider.
+    pub fn ride(&mut self, feet: DVec3) {
+        self.previous_position = self.player.position;
+        self.player.position = feet;
+        self.player.velocity = DVec3::ZERO;
+        self.tick += 1;
+        self.history.clear();
+    }
+
+    /// Makes the player walk through blocks (spectator mode).
+    pub fn set_no_clip(&mut self, no_clip: bool) {
+        self.player.no_clip = no_clip;
     }
 
     /// The kinematic state of the player.
     #[must_use]
     pub fn player(&self) -> &Player {
         &self.player
+    }
+
+    /// The feet position of the player on the previous tick.
+    #[must_use]
+    pub fn previous_position(&self) -> DVec3 {
+        self.previous_position
     }
 
     /// The feet position of the player.
@@ -324,6 +555,16 @@ mod tests {
                 .copied()
                 .unwrap_or(BlockState::AIR)
         }
+    }
+
+    #[test]
+    fn a_rider_is_put_on_the_seat_and_its_motion_is_cleared() {
+        let mut state = GameState::new(DVec3::new(0.0, 5.0, 0.0));
+        state.set_velocity(DVec3::new(0.3, 0.2, 0.1));
+        state.ride(DVec3::new(4.0, 6.0, 4.0));
+        assert_eq!(state.position(), DVec3::new(4.0, 6.0, 4.0));
+        assert_eq!(state.previous_position(), DVec3::new(0.0, 5.0, 0.0));
+        assert_eq!(state.player().velocity, DVec3::ZERO);
     }
 
     #[test]
@@ -389,6 +630,42 @@ mod tests {
             "expected {expected}, got {}",
             state.position().z
         );
+    }
+
+    /// Regression test (GrimAC setbacks, 2026-11-02): a teleport to a position
+    /// the player has been at is taken as it is, nothing is replayed on top.
+    #[test]
+    fn a_teleport_does_not_replay_the_pending_inputs() {
+        let world = TestBlocks::flat();
+        let mut state = GameState::new(DVec3::new(0.0, 1.0, 0.0));
+        let intent = InputIntent::walking(0.0);
+        let mut visited = Vec::new();
+        for _ in 0..10 {
+            state.tick(&intent, &world);
+            visited.push(state.position());
+        }
+        let back = visited[4];
+        let target = ServerCorrection::new(back.x, back.y, back.z, 0.0, 0.0, true);
+        state.teleport(&target, [false; 3]);
+        assert_eq!(state.position(), back);
+        assert_eq!(state.player().velocity, DVec3::ZERO);
+        state.tick(&InputIntent::still(0.0), &world);
+        assert!((state.position() - back).length() < 0.1);
+    }
+
+    #[test]
+    fn a_teleport_keeps_the_motion_of_the_relative_axes() {
+        let world = TestBlocks::flat();
+        let mut state = GameState::new(DVec3::new(0.0, 1.0, 0.0));
+        for _ in 0..5 {
+            state.tick(&InputIntent::walking(0.0), &world);
+        }
+        let moving = state.player().velocity;
+        assert!(moving.z != 0.0);
+        let target = ServerCorrection::new(0.0, 1.0, 0.0, 0.0, 0.0, true);
+        state.teleport(&target, [false, false, true]);
+        assert_eq!(state.player().velocity.z, moving.z);
+        assert_eq!(state.player().velocity.x, 0.0);
     }
 
     #[test]
@@ -514,6 +791,6 @@ mod tests {
         let middle = state.interpolated(0.5).position;
         assert!((middle.z - (previous.z + current.z) / 2.0).abs() < 1e-5);
         // The eye sits 1.62 above the feet.
-        assert!((current.y - (1.0 + physics::EYE_HEIGHT) as f32).abs() < 1e-5);
+        assert!((current.y - (1.0 + physics::EYE_HEIGHT)).abs() < 1e-9);
     }
 }

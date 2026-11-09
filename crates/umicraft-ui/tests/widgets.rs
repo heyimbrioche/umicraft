@@ -11,7 +11,7 @@ use umicraft_ui::widgets::{
     button, list, panel, text_field, ListState, TextFieldState, PANEL_INSET, ROW_HEIGHT,
 };
 use umicraft_ui::{
-    DrawCommand, FontAtlas, InputEvent, Key, PointerButton, Rect, Ui, UiInput, UiOutput,
+    DrawCommand, FontAtlas, InputEvent, Key, Modifiers, PointerButton, Rect, Ui, UiInput, UiOutput,
     UiResponse, WidgetId,
 };
 
@@ -88,14 +88,19 @@ fn text_run(output: &UiOutput, text: &str) -> Option<([f32; 2], f32)> {
         })
 }
 
-/// The thin vertical rectangle of a caret, if the frame drew one.
-fn caret_rect(output: &UiOutput) -> Option<Rect> {
+/// The caret of the frame: the `_` glyph after the text, or the thin bar
+/// drawn inside the text. Returns its left edge and its width.
+fn caret_mark(output: &UiOutput) -> Option<(f32, f32)> {
     output
         .draw_list
         .commands()
         .iter()
+        .rev()
         .find_map(|command| match command {
-            DrawCommand::Rect { rect, .. } if rect.width < 4.0 && rect.height >= 8.0 => Some(*rect),
+            DrawCommand::Text { position, text, .. } if text == "_" => Some((position[0], 0.0)),
+            DrawCommand::Rect { rect, .. } if rect.width < 4.0 && rect.height >= 8.0 => {
+                Some((rect.x, rect.width))
+            }
             _ => None,
         })
 }
@@ -617,13 +622,12 @@ fn text_field_scrolls_and_clips_long_text() {
     );
     assert!(state.scroll_offset() > 0.0);
 
-    let caret = caret_rect(&output).expect("the focused field draws a caret");
-    assert!(caret.x >= clip.x - 0.01, "the caret stays inside the clip");
+    let (caret_x, _) = caret_mark(&output).expect("the focused field draws a caret");
+    assert!(caret_x >= clip.x - 0.01, "the caret stays inside the clip");
     assert!(
-        caret.right() <= clip.right() + 0.01,
+        caret_x + atlas.measure("_", scale) <= clip.right() + 0.01,
         "the caret stays inside the clip"
     );
-    assert!((caret.height - atlas.line_height(scale)).abs() < 0.01);
 
     // Home returns the view to the start of the text.
     run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, key(Key::Home));
@@ -647,7 +651,7 @@ fn text_field_draws_the_caret_only_when_focused() {
         UiInput::default(),
     );
     assert!(
-        caret_rect(&output).is_none(),
+        caret_mark(&output).is_none(),
         "an unfocused field has no caret"
     );
 
@@ -661,7 +665,7 @@ fn text_field_draws_the_caret_only_when_focused() {
         UiInput::default(),
     );
     assert!(
-        caret_rect(&output).is_some(),
+        caret_mark(&output).is_some(),
         "a focused empty field shows the caret"
     );
 
@@ -683,7 +687,7 @@ fn text_field_draws_the_caret_only_when_focused() {
         &mut state,
         UiInput::default(),
     );
-    assert!(caret_rect(&output).is_none());
+    assert!(caret_mark(&output).is_none());
 }
 
 // ------------------------------------------------------------------ list ----
@@ -1135,4 +1139,472 @@ fn debug_screen_list_scrolls_at_720p() {
         "the original list used to fit entirely in a 720-pixel panel"
     );
     assert_eq!(output.draw_list.clip_depth(), 0);
+}
+
+// ----------------------------------------------------------- vanilla look ----
+
+#[test]
+fn the_field_is_a_grey_border_around_a_black_fill_focused_or_not() {
+    let atlas = FontAtlas::fallback();
+    let mut ui = Ui::new(VIEWPORT);
+    let id = ui.id("field");
+    let mut state = TextFieldState::new();
+    let inner = Rect::new(
+        FIELD_RECT.x + 2.0,
+        FIELD_RECT.y + 2.0,
+        FIELD_RECT.width - 4.0,
+        FIELD_RECT.height - 4.0,
+    );
+    for focused in [false, true] {
+        if focused {
+            focus_field(&mut ui, id, FIELD_RECT, &atlas, &mut state);
+        }
+        let (_, output) = run_field(
+            &mut ui,
+            id,
+            FIELD_RECT,
+            &atlas,
+            &mut state,
+            UiInput::default(),
+        );
+        let border = rect_color(&output, FIELD_RECT).expect("a border");
+        let fill = rect_color(&output, inner).expect("a fill");
+        assert_eq!(border, [0.627, 0.627, 0.627, 1.0], "focused: {focused}");
+        assert_eq!(fill, [0.0, 0.0, 0.0, 1.0], "focused: {focused}");
+    }
+}
+
+#[test]
+fn an_empty_field_has_no_placeholder() {
+    let atlas = FontAtlas::fallback();
+    let mut ui = Ui::new(VIEWPORT);
+    let id = ui.id("field");
+    let mut state = TextFieldState::new();
+    let (_, output) = run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        UiInput::default(),
+    );
+    assert_eq!(
+        text_count(&output, ""),
+        0,
+        "an unfocused empty field is blank"
+    );
+}
+
+#[test]
+fn the_caret_blinks_every_six_ticks_and_sits_after_the_text() {
+    let atlas = FontAtlas::fallback();
+    let mut ui = Ui::new(VIEWPORT);
+    let id = ui.id("field");
+    let mut state = TextFieldState::with_text("ab");
+    focus_field(&mut ui, id, FIELD_RECT, &atlas, &mut state);
+    run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, key(Key::End));
+
+    let (_, output) = run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        UiInput::default(),
+    );
+    let (x, width) = caret_mark(&output).expect("visible at the start");
+    assert_eq!(width, 0.0, "an end caret is the underscore glyph");
+    let (text_at, _) = text_run(&output, "ab").expect("the text");
+    assert!(x > text_at[0], "the underscore follows the text");
+
+    for _ in 0..6 {
+        state.tick();
+    }
+    let (_, output) = run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        UiInput::default(),
+    );
+    assert!(caret_mark(&output).is_none(), "hidden in the second half");
+    for _ in 0..6 {
+        state.tick();
+    }
+    let (_, output) = run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        UiInput::default(),
+    );
+    assert!(caret_mark(&output).is_some());
+}
+
+#[test]
+fn a_caret_inside_the_text_is_a_thin_bar() {
+    let atlas = FontAtlas::fallback();
+    let mut ui = Ui::new(VIEWPORT);
+    let id = ui.id("field");
+    let mut state = TextFieldState::with_text("abc");
+    focus_field(&mut ui, id, FIELD_RECT, &atlas, &mut state);
+    run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, key(Key::Home));
+    let (_, output) = run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        UiInput::default(),
+    );
+    let (_, width) = caret_mark(&output).expect("a bar");
+    assert!(width > 0.0);
+}
+
+#[test]
+fn the_scaled_field_uses_the_gui_unit_for_border_and_inset() {
+    let atlas = FontAtlas::fallback();
+    let mut ui = Ui::new(VIEWPORT);
+    let id = ui.id("field");
+    let mut state = TextFieldState::with_text("x");
+    let rect = Rect::new(30.0, 30.0, 600.0, 60.0);
+    ui.begin_frame(VIEWPORT, UiInput::default());
+    umicraft_ui::widgets::text_field_scaled(&mut ui, id, rect, &atlas, &mut state, 3.0);
+    let output = ui.end_frame();
+    let fill = Rect::new(33.0, 33.0, 594.0, 54.0);
+    assert!(rect_color(&output, fill).is_some(), "a 1 unit border");
+    let (position, scale) = text_run(&output, "x").expect("the text");
+    assert_eq!(scale, 3.0);
+    // The first run is the shadow, one unit right of the text.
+    assert_eq!(position[0] - 3.0, 30.0 + 12.0, "inset 4 units");
+}
+
+#[test]
+fn a_disabled_text_field_ignores_input_and_draws_dim_text() {
+    let atlas = FontAtlas::fallback();
+    let mut ui = Ui::new(VIEWPORT);
+    let id = ui.id("field");
+    let mut state = TextFieldState::with_text("locked");
+    focus_field(&mut ui, id, FIELD_RECT, &atlas, &mut state);
+    state.set_disabled(true);
+    assert!(state.is_disabled());
+
+    let (response, output) = run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, typed("x"));
+    assert!(!response.changed, "a disabled field takes no text");
+    assert_eq!(state.text(), "locked");
+    assert!(caret_mark(&output).is_none(), "and shows no caret");
+    let dim = output
+        .draw_list
+        .commands()
+        .iter()
+        .any(|command| match command {
+            DrawCommand::Text { text, style, .. } => {
+                text == "locked" && (style.color[0] - 0.439).abs() < 0.01
+            }
+            _ => false,
+        });
+    assert!(dim, "the text is drawn in 0x707070");
+
+    state.set_disabled(false);
+    let (_, output) = run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, typed("x"));
+    assert_eq!(state.text(), "lockedx");
+    assert!(caret_mark(&output).is_some());
+}
+
+// Selection, clipboard and word shortcuts of the text field
+// (`GuiTextField.textboxKeyTyped`).
+
+const CONTROL: Modifiers = Modifiers {
+    shift: false,
+    control: true,
+    alt: false,
+    meta: false,
+};
+const SHIFT: Modifiers = Modifiers {
+    shift: true,
+    control: false,
+    alt: false,
+    meta: false,
+};
+const CONTROL_SHIFT: Modifiers = Modifiers {
+    shift: true,
+    control: true,
+    alt: false,
+    meta: false,
+};
+
+/// A key press with `modifiers` held.
+fn chord(modifiers: Modifiers, key: Key) -> UiInput {
+    UiInput {
+        events: vec![InputEvent::KeyPressed(key)],
+        modifiers,
+    }
+}
+
+/// A focused field holding `text`, caret at the end, and its UI.
+fn focused(text: &str) -> (Ui, WidgetId, TextFieldState, FontAtlas) {
+    let atlas = FontAtlas::fallback();
+    let mut ui = Ui::new(VIEWPORT);
+    let id = ui.id("field");
+    let mut state = TextFieldState::with_text(text);
+    focus_field(&mut ui, id, FIELD_RECT, &atlas, &mut state);
+    (ui, id, state, atlas)
+}
+
+#[test]
+fn control_a_selects_everything_and_typing_replaces_it() {
+    let (mut ui, id, mut state, atlas) = focused("hello");
+    let (response, output) = run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::A),
+    );
+    assert!(response.changed);
+    assert_eq!(state.selected_text(), "hello");
+    assert!(
+        output.draw_list.commands().iter().any(|command| matches!(
+            command,
+            DrawCommand::Rect { color, .. } if *color == [0.0, 0.0, 1.0, 0.85]
+        )),
+        "the selection is highlighted"
+    );
+
+    run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, typed("x"));
+    assert_eq!(state.text(), "x");
+    assert!(!state.has_selection());
+}
+
+#[test]
+fn control_c_copies_the_selection_and_nothing_when_there_is_none() {
+    let (mut ui, id, mut state, atlas) = focused("hello");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::C),
+    );
+    assert_eq!(
+        ui.take_clipboard(),
+        None,
+        "an empty selection copies nothing"
+    );
+
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::A),
+    );
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::C),
+    );
+    assert_eq!(ui.take_clipboard().as_deref(), Some("hello"));
+    assert_eq!(state.text(), "hello", "a copy leaves the text alone");
+}
+
+#[test]
+fn control_x_cuts_the_selection() {
+    let (mut ui, id, mut state, atlas) = focused("hello");
+    for _ in 0..2 {
+        run_field(
+            &mut ui,
+            id,
+            FIELD_RECT,
+            &atlas,
+            &mut state,
+            chord(SHIFT, Key::ArrowLeft),
+        );
+    }
+    assert_eq!(state.selected_text(), "lo");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::X),
+    );
+    assert_eq!(ui.take_clipboard().as_deref(), Some("lo"));
+    assert_eq!(state.text(), "hel");
+    assert_eq!(state.caret(), 3);
+}
+
+#[test]
+fn a_paste_replaces_the_selection_and_drops_control_characters() {
+    let (mut ui, id, mut state, atlas) = focused("hello");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::A),
+    );
+    let paste = UiInput::new(vec![InputEvent::Paste("play.\nexample.net".to_owned())]);
+    let (response, _) = run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, paste);
+    assert!(response.changed);
+    assert_eq!(state.text(), "play.example.net");
+    assert_eq!(state.caret(), 16);
+}
+
+#[test]
+fn control_backspace_and_control_delete_remove_a_word() {
+    let (mut ui, id, mut state, atlas) = focused("foo bar baz");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::Backspace),
+    );
+    assert_eq!(state.text(), "foo bar ");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::Backspace),
+    );
+    assert_eq!(state.text(), "foo ");
+
+    state.set_caret(0);
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::Delete),
+    );
+    assert_eq!(state.text(), "", "the word and the space after it");
+}
+
+#[test]
+fn backspace_and_delete_remove_only_the_selection() {
+    let (mut ui, id, mut state, atlas) = focused("abcdef");
+    for _ in 0..3 {
+        run_field(
+            &mut ui,
+            id,
+            FIELD_RECT,
+            &atlas,
+            &mut state,
+            chord(SHIFT, Key::ArrowLeft),
+        );
+    }
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        key(Key::Backspace),
+    );
+    assert_eq!(state.text(), "abc");
+
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(SHIFT, Key::Home),
+    );
+    assert_eq!(state.selected_text(), "abc");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        key(Key::Delete),
+    );
+    assert_eq!(state.text(), "");
+}
+
+#[test]
+fn control_arrows_jump_by_words_and_shift_extends_the_selection() {
+    let (mut ui, id, mut state, atlas) = focused("one two  three");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::ArrowLeft),
+    );
+    assert_eq!(state.caret(), 9, "the start of `three`");
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::ArrowLeft),
+    );
+    assert_eq!(state.caret(), 4);
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL, Key::ArrowRight),
+    );
+    assert_eq!(state.caret(), 9, "past the word and the spaces");
+
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        chord(CONTROL_SHIFT, Key::ArrowLeft),
+    );
+    assert_eq!(state.selected_text(), "two  ");
+    // A plain arrow collapses the selection from the moving end.
+    run_field(
+        &mut ui,
+        id,
+        FIELD_RECT,
+        &atlas,
+        &mut state,
+        key(Key::ArrowRight),
+    );
+    assert!(!state.has_selection());
+    assert_eq!(state.caret(), 5);
+}
+
+#[test]
+fn a_control_chord_never_types_its_letter_but_altgr_does() {
+    let (mut ui, id, mut state, atlas) = focused("");
+    let with = |modifiers| UiInput {
+        events: vec![InputEvent::Text("a".to_owned())],
+        modifiers,
+    };
+    run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, with(CONTROL));
+    assert_eq!(state.text(), "");
+    let altgr = Modifiers {
+        control: true,
+        alt: true,
+        ..Modifiers::default()
+    };
+    run_field(&mut ui, id, FIELD_RECT, &atlas, &mut state, with(altgr));
+    assert_eq!(state.text(), "a");
 }

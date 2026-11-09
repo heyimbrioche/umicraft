@@ -25,11 +25,24 @@
 //! cell. Rectangles sample the atlas white texel, whose UV is the same for all
 //! four corners.
 //!
+//! # Brand text and rounded rectangles (ADR-0056)
+//!
+//! Text with [`FontFace::Brand`] is laid out with the atlas given to
+//! [`UiPass::set_brand_atlas`] and goes to its own [`UiBatchKind::BrandFont`]
+//! batch, because it samples another texture with another filter; without a brand
+//! atlas it is drawn with the game font. Rounded rectangles are tessellated here
+//! into triangles over the game atlas white texel: a fill plus a one-pixel ring
+//! whose vertex alpha falls to zero, which antialiases the edge without a shader.
+//! Their triangles are clipped to the scope with Sutherland-Hodgman, since the
+//! alpha ramp cannot be cut by shrinking a quad.
+//!
 //! The base clip is the viewport: geometry outside the render target is never
 //! emitted, exactly as a scissor rectangle covering the target would do.
 
+use std::f32::consts::{FRAC_PI_2, PI};
+
 use thiserror::Error;
-use umicraft_ui::{DrawCommand, DrawList, FontAtlas, Glyph, Rect};
+use umicraft_ui::{DrawCommand, DrawList, FontAtlas, FontFace, Glyph, Rect, TextStyle};
 
 use crate::font;
 use crate::overlay::{Overlay, OverlayVertex};
@@ -96,6 +109,8 @@ pub fn fallback_atlas() -> FontAtlas {
             uv_min,
             uv_max,
             advance: font::CELL_WIDTH as f32,
+            pen: font::CELL_WIDTH as f32,
+            scale: 1.0,
         });
     }
     let (white_min, white_max) = font::cell_uv(font::WHITE_SLOT);
@@ -168,6 +183,39 @@ pub(crate) fn validate_font_atlas(
     Ok(())
 }
 
+/// Which pipeline a batch of vertices should be drawn with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiBatchKind {
+    /// Font atlas pipeline (R8, coverage threshold).
+    Font,
+    /// The brand font atlas: R8 coverage sampled with linear filtering and
+    /// used as a smooth alpha, bound to the second font texture.
+    BrandFont,
+    /// GUI atlas pipeline (RGBA, direct sampling).
+    Gui,
+    /// The GUI atlas drawn with the inverting blend of the crosshair.
+    GuiInverted,
+    /// The same pipeline as [`UiBatchKind::Gui`], bound to the item icon
+    /// atlas instead of the GUI texture.
+    Icon,
+    /// The enchantment glint over the icon quad just before it: the same
+    /// vertex layout, but the vertex colour carries the icon's atlas UV
+    /// rectangle `[u_min, v_min, u_max, v_max]` so the shader can place the
+    /// glint inside the icon. Skipped while no glint texture is uploaded.
+    IconGlint,
+}
+
+/// One contiguous run of vertices drawn with the same pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiBatch {
+    /// Which pipeline to use.
+    pub kind: UiBatchKind,
+    /// Index of the first vertex in the combined buffer.
+    pub first: u32,
+    /// Number of vertices in this batch.
+    pub count: u32,
+}
+
 /// Turns one [`DrawList`] into overlay vertices.
 ///
 /// The pass owns a reusable vertex buffer: [`UiPass::rebuild`] clears it and
@@ -175,6 +223,9 @@ pub(crate) fn validate_font_atlas(
 /// allocation. The resulting vertices are in the same NDC space and use the
 /// same [`OverlayVertex`] layout as [`Overlay`], and therefore draw with the
 /// existing overlay pipeline.
+///
+/// `Image` commands produce vertices in a separate batch that the renderer
+/// draws with the GUI overlay pipeline instead of the font pipeline.
 ///
 /// # Example
 ///
@@ -196,6 +247,12 @@ pub struct UiPass {
     overlay: Overlay,
     clip: Option<Rect>,
     clip_stack: Vec<Option<Rect>>,
+    batches: Vec<UiBatch>,
+    /// Atlas of [`FontFace::Brand`] text; `None` draws it with the game font.
+    brand: Option<FontAtlas>,
+    /// Scratch polygons of the rounded-rectangle clipper, reused every frame.
+    polygon: Vec<FringeVertex>,
+    clipped: Vec<FringeVertex>,
 }
 
 impl UiPass {
@@ -212,7 +269,20 @@ impl UiPass {
             overlay: Overlay::new(pixel_width, pixel_height),
             clip: Some(Rect::new(0.0, 0.0, width, height)),
             clip_stack: Vec::new(),
+            batches: Vec::new(),
+            brand: None,
+            polygon: Vec::new(),
+            clipped: Vec::new(),
         }
+    }
+
+    /// Sets the atlas that [`FontFace::Brand`] text is laid out and drawn
+    /// with, or `None` to draw it with the game atlas again.
+    ///
+    /// The renderer calls this from `Renderer::set_brand_font`; the atlas must
+    /// be the one bound as the brand texture, since glyph UVs refer to it.
+    pub fn set_brand_atlas(&mut self, atlas: Option<FontAtlas>) {
+        self.brand = atlas;
     }
 
     /// Updates the viewport size, drops the old vertices and resets the clip
@@ -229,6 +299,7 @@ impl UiPass {
         self.overlay.clear();
         self.clip = Some(Rect::new(0.0, 0.0, self.width, self.height));
         self.clip_stack.clear();
+        self.batches.clear();
     }
 
     /// True when the last rebuild produced no geometry.
@@ -258,20 +329,134 @@ impl UiPass {
     /// `'\n'` have no glyph and no advance. `PushClip` intersects the current
     /// scope with its rectangle, `PopClip` restores the previous one, and an
     /// empty intersection suppresses every command until the scope is popped.
+    ///
+    /// `Image` commands are interleaved with font commands: each contiguous
+    /// run of the same pipeline kind becomes one [`UiBatch`], available via
+    /// [`UiPass::batches`].
     pub fn rebuild(&mut self, draw_list: &DrawList, atlas: &FontAtlas) {
+        self.rebuild_with_icons(draw_list, atlas, &|_| None);
+    }
+
+    /// Like [`UiPass::rebuild`], and draws `Item` commands from the icon
+    /// atlas: `icon_uv` maps an icon key to its `[u_min, v_min, u_max,
+    /// v_max]` rectangle, or `None` while the icon is not rendered (the item
+    /// is skipped).
+    pub fn rebuild_with_icons(
+        &mut self,
+        draw_list: &DrawList,
+        atlas: &FontAtlas,
+        icon_uv: &dyn Fn(u64) -> Option<[f32; 4]>,
+    ) {
+        umicraft_core::profile_scope!("ui_pass rebuild");
         self.clear();
+        // Taken so that the brand atlas can be lent to `push_text` while the
+        // pass itself is borrowed mutably; put back below.
+        let brand = self.brand.take();
+        let mut current_kind = UiBatchKind::Font;
+        let mut batch_start: u32 = 0;
+
         for command in draw_list.commands() {
             match command {
-                DrawCommand::Rect { rect, color } => self.push_rect(*rect, *color, atlas),
+                DrawCommand::Rect { rect, color } => {
+                    self.flush_batch_if_needed(
+                        UiBatchKind::Font,
+                        &mut current_kind,
+                        &mut batch_start,
+                    );
+                    self.push_rect(*rect, *color, atlas);
+                }
+                DrawCommand::RoundedRect {
+                    rect,
+                    radius,
+                    color,
+                } => {
+                    self.flush_batch_if_needed(
+                        UiBatchKind::Font,
+                        &mut current_kind,
+                        &mut batch_start,
+                    );
+                    self.push_rounded_rect(*rect, *radius, *color, atlas);
+                }
+                DrawCommand::VerticalGradient { rect, top, bottom } => {
+                    self.flush_batch_if_needed(
+                        UiBatchKind::Font,
+                        &mut current_kind,
+                        &mut batch_start,
+                    );
+                    self.push_vertical_gradient(*rect, [*top, *bottom], atlas);
+                }
                 DrawCommand::Text {
                     position,
                     text,
                     style,
-                } => self.push_text(*position, text, style.scale, style.color, atlas),
+                } => {
+                    let (kind, face_atlas) = match (style.face, brand.as_ref()) {
+                        (FontFace::Brand, Some(brand)) => (UiBatchKind::BrandFont, brand),
+                        _ => (UiBatchKind::Font, atlas),
+                    };
+                    self.flush_batch_if_needed(kind, &mut current_kind, &mut batch_start);
+                    self.push_text(*position, text, style, face_atlas);
+                }
+                DrawCommand::Image { src, dst, color } => {
+                    self.flush_batch_if_needed(
+                        UiBatchKind::Gui,
+                        &mut current_kind,
+                        &mut batch_start,
+                    );
+                    self.push_image(*src, *dst, *color);
+                }
+                DrawCommand::InvertedImage { src, dst } => {
+                    self.flush_batch_if_needed(
+                        UiBatchKind::GuiInverted,
+                        &mut current_kind,
+                        &mut batch_start,
+                    );
+                    self.push_image(*src, *dst, [1.0; 4]);
+                }
+                DrawCommand::Item { key, dst, glint } => {
+                    if let Some(uv) = icon_uv(*key) {
+                        self.flush_batch_if_needed(
+                            UiBatchKind::Icon,
+                            &mut current_kind,
+                            &mut batch_start,
+                        );
+                        self.push_image(uv, *dst, [1.0; 4]);
+                        if *glint {
+                            self.flush_batch_if_needed(
+                                UiBatchKind::IconGlint,
+                                &mut current_kind,
+                                &mut batch_start,
+                            );
+                            self.push_image(uv, *dst, uv);
+                        }
+                    }
+                }
                 DrawCommand::PushClip { rect } => self.push_clip(*rect),
                 DrawCommand::PopClip => self.pop_clip(),
             }
         }
+
+        self.brand = brand;
+
+        // Close the last open batch.
+        let total = self.overlay.vertex_count();
+        if total > batch_start {
+            self.batches.push(UiBatch {
+                kind: current_kind,
+                first: batch_start,
+                count: total - batch_start,
+            });
+        }
+    }
+
+    /// The draw batches produced by the last [`UiPass::rebuild`].
+    ///
+    /// Each batch records the pipeline kind and the vertex range. The
+    /// renderer iterates these, switching between the font and GUI pipelines
+    /// as needed.
+    #[must_use]
+    pub fn batches(&self) -> &[UiBatch] {
+        &self.batches
     }
 
     fn push_rect(&mut self, rect: Rect, color: [f32; 4], atlas: &FontAtlas) {
@@ -290,14 +475,141 @@ impl UiPass {
         );
     }
 
-    fn push_text(
+    /// Two triangles whose corner colours interpolate `colors` (top, bottom)
+    /// at the clipped edges, so a clipped gradient keeps its slope.
+    fn push_vertical_gradient(&mut self, rect: Rect, colors: [[f32; 4]; 2], atlas: &FontAtlas) {
+        let (Some(full), Some(clip)) = (drawable(rect), self.clip) else {
+            return;
+        };
+        let Some(visible) = full.intersect(clip) else {
+            return;
+        };
+        let at = |y: f32| -> [f32; 4] {
+            let t = (y - full.y) / full.height;
+            std::array::from_fn(|i| colors[0][i] + (colors[1][i] - colors[0][i]) * t)
+        };
+        let (top, bottom) = (visible.y, visible.y + visible.height);
+        let (left, right) = (visible.x, visible.x + visible.width);
+        let (upper, lower) = (at(top), at(bottom));
+        let uv = white_texel_uv(atlas);
+        self.overlay.push_triangle(
+            [[left, top], [right, top], [right, bottom]],
+            uv,
+            [upper, upper, lower],
+        );
+        self.overlay.push_triangle(
+            [[left, top], [right, bottom], [left, bottom]],
+            uv,
+            [upper, lower, lower],
+        );
+    }
+
+    /// Tessellates a rounded rectangle: an opaque fill of the shape inset by
+    /// half a pixel, and a one-pixel ring around its edge whose alpha falls
+    /// from 1 to 0 (the antialiasing fringe). A pixel-aligned straight edge
+    /// therefore stays crisp. Every triangle is clipped to the current scope.
+    fn push_rounded_rect(&mut self, rect: Rect, radius: f32, color: [f32; 4], atlas: &FontAtlas) {
+        let (Some(rect), Some(clip)) = (drawable(rect), self.clip) else {
+            return;
+        };
+        let shape = RoundedShape::new(rect, radius);
+        if shape.radius <= 0.0 {
+            self.push_rect(rect, color, atlas);
+            return;
+        }
+        let uv = white_texel_uv(atlas);
+        let inset = FRINGE.min(shape.max_radius());
+        let centre =
+            FringeVertex::opaque_at([rect.x + rect.width / 2.0, rect.y + rect.height / 2.0]);
+        let inner = |i| FringeVertex::opaque_at(shape.outline_point(i, -inset));
+        let outer = |i| FringeVertex::clear_at(shape.outline_point(i, FRINGE));
+        let count = shape.outline_len();
+        for index in 0..count {
+            let next = (index + 1) % count;
+            self.emit_polygon(&[centre, inner(index), inner(next)], color, uv, clip);
+            self.emit_polygon(
+                &[inner(index), outer(index), outer(next), inner(next)],
+                color,
+                uv,
+                clip,
+            );
+        }
+    }
+
+    /// Clips the convex `corners` to `clip` and appends the result as a
+    /// triangle fan, scaling the alpha of `color` by each vertex.
+    fn emit_polygon(
         &mut self,
-        position: [f32; 2],
-        text: &str,
-        scale: f32,
+        corners: &[FringeVertex],
         color: [f32; 4],
-        atlas: &FontAtlas,
+        uv: [f32; 2],
+        clip: Rect,
     ) {
+        self.polygon.clear();
+        self.polygon.extend_from_slice(corners);
+        for edge in ClipEdge::around(clip) {
+            edge.clip(&self.polygon, &mut self.clipped);
+            std::mem::swap(&mut self.polygon, &mut self.clipped);
+            if self.polygon.len() < 3 {
+                return;
+            }
+        }
+        let tint = |vertex: &FringeVertex| [color[0], color[1], color[2], color[3] * vertex.alpha];
+        let first = self.polygon[0];
+        for pair in self.polygon[1..].windows(2) {
+            self.overlay.push_triangle(
+                [first.position, pair[0].position, pair[1].position],
+                uv,
+                [tint(&first), tint(&pair[0]), tint(&pair[1])],
+            );
+        }
+    }
+
+    fn push_image(&mut self, src: [f32; 4], dst: Rect, color: [f32; 4]) {
+        let (Some(visible), Some(clip)) = (drawable(dst), self.clip) else {
+            return;
+        };
+        let Some(visible) = visible.intersect(clip) else {
+            return;
+        };
+        let [u_min, v_min, u_max, v_max] = src;
+        let u_span = u_max - u_min;
+        let v_span = v_max - v_min;
+        let cu0 = u_min + (visible.x - dst.x) / dst.width * u_span;
+        let cv0 = v_min + (visible.y - dst.y) / dst.height * v_span;
+        let cu1 = u_min + (visible.right() - dst.x) / dst.width * u_span;
+        let cv1 = v_min + (visible.bottom() - dst.y) / dst.height * v_span;
+        self.overlay.push_quad(
+            [visible.x, visible.y, visible.width, visible.height],
+            [cu0, cv0],
+            [cu1, cv1],
+            color,
+        );
+    }
+
+    fn flush_batch_if_needed(
+        &mut self,
+        needed: UiBatchKind,
+        current: &mut UiBatchKind,
+        start: &mut u32,
+    ) {
+        if *current == needed {
+            return;
+        }
+        let total = self.overlay.vertex_count();
+        if total > *start {
+            self.batches.push(UiBatch {
+                kind: *current,
+                first: *start,
+                count: total - *start,
+            });
+        }
+        *current = needed;
+        *start = total;
+    }
+
+    fn push_text(&mut self, position: [f32; 2], text: &str, style: &TextStyle, atlas: &FontAtlas) {
+        let (scale, color) = (style.scale, style.color);
         let Some(clip) = self.clip else {
             return;
         };
@@ -319,6 +631,11 @@ impl UiPass {
                 continue;
             };
             let quad = glyph_quad(cursor, glyph, atlas, scale);
+            if style.rotation != 0.0 {
+                self.push_turned_glyph(quad, (position, style.rotation), glyph, color, clip);
+                cursor[0] += glyph.pen.trunc() * scale;
+                continue;
+            }
             if let Some(visible) = drawable(quad).and_then(|quad| quad.intersect(clip)) {
                 let (uv_min, uv_max) = clipped_uv(glyph, quad, visible);
                 self.overlay.push_quad(
@@ -328,7 +645,32 @@ impl UiPass {
                     color,
                 );
             }
-            cursor[0] += glyph.advance * scale;
+            // `renderStringAtPos`: `posX += (float)((int) f)` of what the
+            // glyph drew, which is not what `getCharWidth` measures.
+            cursor[0] += glyph.pen.trunc() * scale;
+        }
+    }
+
+    /// A glyph of turned text: its quad turned around the text origin. The
+    /// clip only culls glyphs whose bounding box is outside it; a glyph that
+    /// straddles the clip edge is drawn whole.
+    fn push_turned_glyph(
+        &mut self,
+        quad: Rect,
+        (origin, radians): ([f32; 2], f32),
+        glyph: &Glyph,
+        color: [f32; 4],
+        clip: Rect,
+    ) {
+        let corners = turned_corners(quad, origin, radians);
+        let xs = corners.map(|c| c[0]);
+        let ys = corners.map(|c| c[1]);
+        let low = |v: [f32; 4]| v.into_iter().fold(f32::INFINITY, f32::min);
+        let high = |v: [f32; 4]| v.into_iter().fold(f32::NEG_INFINITY, f32::max);
+        let bounds = Rect::new(low(xs), low(ys), high(xs) - low(xs), high(ys) - low(ys));
+        if bounds.intersect(clip).is_some() {
+            self.overlay
+                .push_corners(corners, glyph.uv_min, glyph.uv_max, color);
         }
     }
 
@@ -344,6 +686,160 @@ impl UiPass {
     fn pop_clip(&mut self) {
         if let Some(previous) = self.clip_stack.pop() {
             self.clip = previous;
+        }
+    }
+}
+
+/// Half the width of the antialiasing fringe of a rounded rectangle, in
+/// physical pixels: the shape edge is the middle of a one-pixel ramp.
+const FRINGE: f32 = 0.5;
+
+/// A polygon corner with the share of the shape colour it carries.
+#[derive(Debug, Clone, Copy)]
+struct FringeVertex {
+    position: [f32; 2],
+    alpha: f32,
+}
+
+impl FringeVertex {
+    fn opaque_at(position: [f32; 2]) -> Self {
+        Self {
+            position,
+            alpha: 1.0,
+        }
+    }
+
+    fn clear_at(position: [f32; 2]) -> Self {
+        Self {
+            position,
+            alpha: 0.0,
+        }
+    }
+
+    fn lerp(self, other: Self, t: f32) -> Self {
+        Self {
+            position: [
+                self.position[0] + (other.position[0] - self.position[0]) * t,
+                self.position[1] + (other.position[1] - self.position[1]) * t,
+            ],
+            alpha: self.alpha + (other.alpha - self.alpha) * t,
+        }
+    }
+}
+
+/// The outline of a rounded rectangle as a closed polygon: four arcs of
+/// `segments + 1` points each, clockwise from the top-right corner.
+struct RoundedShape {
+    rect: Rect,
+    radius: f32,
+    segments: usize,
+}
+
+impl RoundedShape {
+    /// The radius is clamped to half the shorter side; a radius that is
+    /// zero, negative or not finite gives a plain rectangle.
+    fn new(rect: Rect, radius: f32) -> Self {
+        let max_radius = rect.width.min(rect.height) / 2.0;
+        let radius = if radius.is_finite() {
+            radius.clamp(0.0, max_radius)
+        } else {
+            0.0
+        };
+        // Two segments per square root of a pixel of radius keeps the arc
+        // error well below a pixel; the cap bounds the vertex count.
+        let segments = ((radius.sqrt() * 2.0).ceil() as usize).clamp(2, 16);
+        Self {
+            rect,
+            radius,
+            segments,
+        }
+    }
+
+    /// Half the shorter side: the largest radius the rectangle can have.
+    fn max_radius(&self) -> f32 {
+        self.rect.width.min(self.rect.height) / 2.0
+    }
+
+    /// Number of points of the outline.
+    fn outline_len(&self) -> usize {
+        4 * (self.segments + 1)
+    }
+
+    /// Point `index` of the outline, moved `offset` pixels away from the
+    /// shape (negative: inwards). Arcs keep their centres, so the offset
+    /// outline is the same shape with a radius changed by `offset`.
+    fn outline_point(&self, index: usize, offset: f32) -> [f32; 2] {
+        let per_corner = self.segments + 1;
+        let (corner, step) = (index / per_corner, index % per_corner);
+        let r = self.radius;
+        let (left, top) = (self.rect.x, self.rect.y);
+        let (right, bottom) = (self.rect.right(), self.rect.bottom());
+        let (centre, start) = [
+            ([right - r, top + r], -FRAC_PI_2),
+            ([right - r, bottom - r], 0.0),
+            ([left + r, bottom - r], FRAC_PI_2),
+            ([left + r, top + r], PI),
+        ][corner];
+        let angle = start + FRAC_PI_2 * step as f32 / self.segments as f32;
+        let reach = (r + offset).max(0.0);
+        [
+            centre[0] + reach * angle.cos(),
+            centre[1] + reach * angle.sin(),
+        ]
+    }
+}
+
+/// One side of the clip rectangle, as a half-plane for polygon clipping.
+#[derive(Clone, Copy)]
+struct ClipEdge {
+    axis: usize,
+    bound: f32,
+    keep_above: bool,
+}
+
+impl ClipEdge {
+    /// The four sides of `clip`.
+    fn around(clip: Rect) -> [Self; 4] {
+        let side = |axis, bound, keep_above| Self {
+            axis,
+            bound,
+            keep_above,
+        };
+        [
+            side(0, clip.x, true),
+            side(0, clip.right(), false),
+            side(1, clip.y, true),
+            side(1, clip.bottom(), false),
+        ]
+    }
+
+    fn contains(self, vertex: &FringeVertex) -> bool {
+        let value = vertex.position[self.axis];
+        if self.keep_above {
+            value >= self.bound
+        } else {
+            value <= self.bound
+        }
+    }
+
+    /// Sutherland-Hodgman step: the part of the convex `input` inside this
+    /// half-plane, written to `output` (cleared first). Alpha is
+    /// interpolated along cut edges.
+    fn clip(self, input: &[FringeVertex], output: &mut Vec<FringeVertex>) {
+        output.clear();
+        let Some(&last) = input.last() else {
+            return;
+        };
+        let mut previous = last;
+        for &current in input {
+            if self.contains(&current) != self.contains(&previous) {
+                let (from, to) = (previous.position[self.axis], current.position[self.axis]);
+                output.push(previous.lerp(current, (self.bound - from) / (to - from)));
+            }
+            if self.contains(&current) {
+                output.push(current);
+            }
+            previous = current;
         }
     }
 }
@@ -368,9 +864,28 @@ fn glyph_quad(cursor: [f32; 2], glyph: &Glyph, atlas: &FontAtlas, scale: f32) ->
     Rect::new(
         cursor[0],
         cursor[1],
-        (glyph.uv_max[0] - glyph.uv_min[0]) * atlas.width as f32 * scale,
-        (glyph.uv_max[1] - glyph.uv_min[1]) * atlas.height as f32 * scale,
+        (glyph.uv_max[0] - glyph.uv_min[0]) * atlas.width as f32 * scale * glyph.scale,
+        (glyph.uv_max[1] - glyph.uv_min[1]) * atlas.height as f32 * scale * glyph.scale,
     )
+}
+
+/// The corners of `quad` (top-left first, clockwise) turned by `radians`
+/// around `origin`.
+fn turned_corners(quad: Rect, origin: [f32; 2], radians: f32) -> [[f32; 2]; 4] {
+    let (sin, cos) = radians.sin_cos();
+    [
+        [quad.x, quad.y],
+        [quad.right(), quad.y],
+        [quad.right(), quad.bottom()],
+        [quad.x, quad.bottom()],
+    ]
+    .map(|[x, y]| {
+        let (dx, dy) = (x - origin[0], y - origin[1]);
+        [
+            origin[0] + dx * cos - dy * sin,
+            origin[1] + dx * sin + dy * cos,
+        ]
+    })
 }
 
 /// The part of `glyph`'s UV rectangle that corresponds to `visible`.
@@ -403,6 +918,53 @@ mod tests {
 
     const COLOR: [f32; 4] = [0.2, 0.4, 0.6, 0.8];
 
+    #[test]
+    fn a_quarter_turn_swaps_the_axes_of_a_quad() {
+        let quad = umicraft_ui::Rect::new(10.0, 10.0, 8.0, 4.0);
+        let corners = turned_corners(quad, [10.0, 10.0], std::f32::consts::FRAC_PI_2);
+        // The top-right corner (+8, 0) goes to (0, +8): text turned
+        // clockwise on a y-down screen runs downwards.
+        assert!((corners[1][0] - 10.0).abs() < 1e-4 && (corners[1][1] - 18.0).abs() < 1e-4);
+        assert!((corners[3][0] - 6.0).abs() < 1e-4 && (corners[3][1] - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn turned_text_covers_a_taller_box_than_upright_text() {
+        let height = |rotation: f32| {
+            let mut list = DrawList::new();
+            let style = TextStyle::new(2.0, COLOR).rotated(rotation);
+            list.text([10.0, 40.0], "WWWWWWWW", style);
+            let mut pass = UiPass::new(128, 128);
+            pass.rebuild(&list, &atlas());
+            let ys: Vec<f32> = pass
+                .overlay
+                .vertices()
+                .iter()
+                .map(|v| v.position[1])
+                .collect();
+            let low = ys.iter().copied().fold(f32::INFINITY, f32::min);
+            let high = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            high - low
+        };
+        assert!(height(-20f32.to_radians()) > height(0.0) * 1.5);
+    }
+
+    #[test]
+    fn an_inverted_image_gets_its_own_batch() {
+        let mut list = DrawList::new();
+        let dst = umicraft_ui::Rect::new(0.0, 0.0, 16.0, 16.0);
+        list.image([0.0, 0.0, 0.5, 0.5], dst, [1.0; 4]);
+        list.image_inverted([0.0, 0.0, 0.5, 0.5], dst);
+        list.image_inverted([0.0, 0.0, 0.5, 0.5], dst);
+        let mut pass = UiPass::new(64, 64);
+        pass.rebuild(&list, &atlas());
+        let kinds: Vec<_> = pass.batches().iter().map(|b| (b.kind, b.count)).collect();
+        assert_eq!(
+            kinds,
+            [(UiBatchKind::Gui, 6), (UiBatchKind::GuiInverted, 12)]
+        );
+    }
+
     fn atlas() -> FontAtlas {
         FontAtlas::new(
             16,
@@ -414,12 +976,16 @@ mod tests {
                     uv_min: [0.0, 0.0],
                     uv_max: [0.5, 1.0],
                     advance: 4.0,
+                    pen: 4.0,
+                    scale: 1.0,
                 },
                 Glyph {
                     character: 'B',
                     uv_min: [0.5, 0.0],
                     uv_max: [1.0, 1.0],
                     advance: 6.0,
+                    pen: 6.0,
+                    scale: 1.0,
                 },
             ],
             10.0,
@@ -432,6 +998,49 @@ mod tests {
             (actual[0] - expected[0]).abs() < 1e-5 && (actual[1] - expected[1]).abs() < 1e-5,
             "expected {expected:?}, got {actual:?}"
         );
+    }
+
+    #[test]
+    fn items_draw_from_the_icon_atlas_in_command_order() {
+        let mut list = DrawList::new();
+        list.rect(Rect::new(0.0, 0.0, 16.0, 16.0), [1.0; 4]);
+        list.item(7, Rect::new(0.0, 0.0, 16.0, 16.0), false);
+        list.item(8, Rect::new(16.0, 0.0, 16.0, 16.0), false);
+        let mut pass = UiPass::new(64, 64);
+        pass.rebuild_with_icons(&list, &atlas(), &|key| {
+            (key == 7).then_some([0.0, 0.0, 0.5, 0.5])
+        });
+        let kinds: Vec<UiBatchKind> = pass.batches().iter().map(|batch| batch.kind).collect();
+        assert_eq!(kinds, [UiBatchKind::Font, UiBatchKind::Icon]);
+        // Key 8 has no rendered icon yet and draws nothing.
+        assert_eq!(pass.batches()[1].count, 6);
+    }
+
+    #[test]
+    fn a_glint_item_emits_an_icon_batch_then_a_glint_batch_over_the_same_quad() {
+        let mut list = DrawList::new();
+        list.item(7, Rect::new(0.0, 0.0, 16.0, 16.0), true);
+        list.item(7, Rect::new(16.0, 0.0, 16.0, 16.0), false);
+        let uv = [0.0, 0.25, 0.5, 0.75];
+        let mut pass = UiPass::new(64, 64);
+        pass.rebuild_with_icons(&list, &atlas(), &|_| Some(uv));
+        let batches: Vec<(UiBatchKind, u32)> = pass
+            .batches()
+            .iter()
+            .map(|batch| (batch.kind, batch.count))
+            .collect();
+        assert_eq!(
+            batches,
+            [
+                (UiBatchKind::Icon, 6),
+                (UiBatchKind::IconGlint, 6),
+                (UiBatchKind::Icon, 6)
+            ]
+        );
+        // The glint quad repeats the icon quad and carries the atlas rect.
+        let vertices = pass.vertices();
+        assert_eq!(vertices[0].position, vertices[6].position);
+        assert_eq!(vertices[6].color, uv);
     }
 
     #[test]
@@ -649,6 +1258,272 @@ mod tests {
             validate_font_atlas(&bad_white, 8192),
             Err(FontAtlasError::InvalidWhiteUv([0.5, 0.5, 0.4, 1.0]))
         );
+    }
+
+    /// A 32×16 atlas whose 'A' is 16×16 texels, unlike the game test atlas
+    /// where it is 8 wide, so the face that drew a glyph shows in its quad.
+    fn brand_atlas() -> FontAtlas {
+        FontAtlas::new(
+            32,
+            16,
+            vec![0; 32 * 16],
+            vec![Glyph {
+                character: 'A',
+                uv_min: [0.0, 0.0],
+                uv_max: [0.5, 1.0],
+                advance: 16.0,
+                pen: 16.0,
+                scale: 1.0,
+            }],
+            20.0,
+            [0.9, 0.9, 1.0, 1.0],
+        )
+    }
+
+    fn brand_style() -> TextStyle {
+        TextStyle::new(1.0, COLOR).with_face(umicraft_ui::FontFace::Brand)
+    }
+
+    /// Pixel-space bounds `[min_x, min_y, max_x, max_y]` of the vertices of a
+    /// 100×100 pass.
+    fn pixel_bounds(pass: &UiPass) -> [f32; 4] {
+        let mut bounds = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for vertex in pass.vertices() {
+            let x = (vertex.position[0] + 1.0) * 50.0;
+            let y = (1.0 - vertex.position[1]) * 50.0;
+            bounds = [
+                bounds[0].min(x),
+                bounds[1].min(y),
+                bounds[2].max(x),
+                bounds[3].max(y),
+            ];
+        }
+        bounds
+    }
+
+    fn rounded_pass(rect: Rect, radius: f32, clip: Option<Rect>) -> UiPass {
+        let mut list = DrawList::new();
+        if let Some(clip) = clip {
+            list.push_clip(clip);
+        }
+        list.rounded_rect(rect, radius, COLOR);
+        let mut pass = UiPass::new(100, 100);
+        pass.rebuild(&list, &atlas());
+        pass
+    }
+
+    #[test]
+    fn brand_text_is_batched_apart_and_uses_the_brand_metrics() {
+        let mut list = DrawList::new();
+        list.text([0.0, 0.0], "A", TextStyle::new(1.0, COLOR));
+        list.text([0.0, 20.0], "A", brand_style());
+        list.rect(Rect::new(0.0, 40.0, 4.0, 4.0), COLOR);
+        let mut pass = UiPass::new(100, 100);
+        pass.set_brand_atlas(Some(brand_atlas()));
+        pass.rebuild(&list, &atlas());
+
+        let kinds: Vec<_> = pass.batches().iter().map(|b| (b.kind, b.count)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (UiBatchKind::Font, 6),
+                (UiBatchKind::BrandFont, 6),
+                (UiBatchKind::Font, 6)
+            ]
+        );
+        let width =
+            |vertices: &[OverlayVertex]| (vertices[1].position[0] - vertices[0].position[0]) * 50.0;
+        assert!((width(&pass.vertices()[0..6]) - 8.0).abs() < 1e-3);
+        assert!((width(&pass.vertices()[6..12]) - 16.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn brand_text_falls_back_to_the_game_font_without_a_brand_atlas() {
+        let mut list = DrawList::new();
+        list.text([0.0, 0.0], "A", brand_style());
+        let mut pass = UiPass::new(100, 100);
+        pass.rebuild(&list, &atlas());
+        let kinds: Vec<_> = pass.batches().iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, [UiBatchKind::Font]);
+        let width = (pass.vertices()[1].position[0] - pass.vertices()[0].position[0]) * 50.0;
+        assert!((width - 8.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_brand_atlas_survives_rebuilds_and_can_be_removed() {
+        let mut list = DrawList::new();
+        list.text([0.0, 0.0], "A", brand_style());
+        let mut pass = UiPass::new(100, 100);
+        pass.set_brand_atlas(Some(brand_atlas()));
+        for _ in 0..2 {
+            pass.rebuild(&list, &atlas());
+            assert_eq!(pass.batches()[0].kind, UiBatchKind::BrandFont);
+        }
+        pass.set_brand_atlas(None);
+        pass.rebuild(&list, &atlas());
+        assert_eq!(pass.batches()[0].kind, UiBatchKind::Font);
+    }
+
+    #[test]
+    fn turned_and_clipped_brand_text_keep_working() {
+        let mut pass = UiPass::new(100, 100);
+        pass.set_brand_atlas(Some(brand_atlas()));
+
+        let mut list = DrawList::new();
+        list.text([20.0, 20.0], "A", brand_style().rotated(0.5));
+        pass.rebuild(&list, &atlas());
+        assert_eq!(pass.batches()[0].kind, UiBatchKind::BrandFont);
+        assert_eq!(pass.vertex_count(), 6);
+
+        let mut list = DrawList::new();
+        list.push_clip(Rect::new(0.0, 0.0, 10.0, 10.0));
+        list.text([50.0, 50.0], "A", brand_style());
+        list.text([50.0, 50.0], "A", brand_style().rotated(0.5));
+        pass.rebuild(&list, &atlas());
+        assert!(pass.is_empty());
+
+        let mut list = DrawList::new();
+        list.push_clip(Rect::new(0.0, 0.0, 8.0, 100.0));
+        list.text([0.0, 0.0], "A", brand_style());
+        pass.rebuild(&list, &atlas());
+        let [_, _, right, _] = pixel_bounds(&pass);
+        assert!((right - 8.0).abs() < 1e-3);
+        // Half of the 16-texel glyph is visible: the UV is cut in half.
+        assert!((pass.vertices()[1].uv[0] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_rounded_rect_is_a_fan_and_a_ring_of_triangles() {
+        // radius 4 -> 4 segments per corner -> 20 outline points, each with
+        // one fill triangle and one two-triangle ring quad.
+        let pass = rounded_pass(Rect::new(10.0, 10.0, 40.0, 30.0), 4.0, None);
+        assert_eq!(pass.vertex_count(), 20 * 9);
+        assert_eq!(
+            pass.batches(),
+            [UiBatch {
+                kind: UiBatchKind::Font,
+                first: 0,
+                count: 180
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rounded_rect_without_radius_is_a_plain_rect() {
+        for radius in [0.0, -3.0, f32::NAN] {
+            let pass = rounded_pass(Rect::new(10.0, 10.0, 40.0, 30.0), radius, None);
+            assert_eq!(pass.vertex_count(), 6);
+        }
+    }
+
+    #[test]
+    fn a_rounded_rect_fades_to_transparent_on_a_one_pixel_fringe() {
+        let rect = Rect::new(10.0, 10.0, 40.0, 30.0);
+        let pass = rounded_pass(rect, 6.0, None);
+        let alphas: Vec<f32> = pass.vertices().iter().map(|v| v.color[3]).collect();
+        assert!(alphas
+            .iter()
+            .all(|a| *a == 0.0 || (*a - COLOR[3]).abs() < 1e-6));
+        assert!(alphas.contains(&0.0) && alphas.contains(&COLOR[3]));
+        // The ramp is centred on the edge: half a pixel out, half a pixel in.
+        let [x0, y0, x1, y1] = pixel_bounds(&pass);
+        assert!((x0 - 9.5).abs() < 1e-3 && (y0 - 9.5).abs() < 1e-3);
+        assert!((x1 - 50.5).abs() < 1e-3 && (y1 - 40.5).abs() < 1e-3);
+        // The colour is the shape colour, sampled from the white texel.
+        assert!(pass.vertices().iter().all(|v| v.color[..3] == COLOR[..3]));
+        assert!(pass.vertices().iter().all(|v| v.uv == [0.875, 0.75]));
+    }
+
+    #[test]
+    fn a_too_large_radius_is_clamped_to_half_the_shorter_side() {
+        let rect = Rect::new(10.0, 10.0, 40.0, 20.0);
+        let huge = rounded_pass(rect, 1000.0, None);
+        let half = rounded_pass(rect, 10.0, None);
+        assert_eq!(huge.vertices(), half.vertices());
+        // A pill's ends are semicircles: its left tip reaches the rect edge.
+        let [x0, ..] = pixel_bounds(&huge);
+        assert!((x0 - 9.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_rounded_rect_is_clipped_with_its_fringe_interpolated() {
+        let clip = Rect::new(20.0, 15.0, 10.0, 10.0);
+        let pass = rounded_pass(Rect::new(10.0, 10.0, 40.0, 30.0), 6.0, Some(clip));
+        assert!(!pass.is_empty());
+        let [x0, y0, x1, y1] = pixel_bounds(&pass);
+        assert!(x0 >= 20.0 - 1e-3 && y0 >= 15.0 - 1e-3);
+        assert!(x1 <= 30.0 + 1e-3 && y1 <= 25.0 + 1e-3);
+        // The clip lies inside the shape, away from its fringe: all opaque.
+        assert!(pass
+            .vertices()
+            .iter()
+            .all(|v| (v.color[3] - COLOR[3]).abs() < 1e-6));
+    }
+
+    #[test]
+    fn a_rounded_rect_outside_the_clip_or_degenerate_draws_nothing() {
+        let clip = Rect::new(80.0, 80.0, 10.0, 10.0);
+        assert!(rounded_pass(Rect::new(10.0, 10.0, 40.0, 30.0), 6.0, Some(clip)).is_empty());
+        assert!(rounded_pass(Rect::new(10.0, 10.0, 0.0, 30.0), 6.0, None).is_empty());
+    }
+
+    #[test]
+    fn a_tiny_rounded_rect_keeps_a_valid_fringe() {
+        let pass = rounded_pass(Rect::new(10.0, 10.0, 0.4, 0.4), 6.0, None);
+        assert!(pass
+            .vertices()
+            .iter()
+            .all(|v| v.position.iter().all(|c| c.is_finite())));
+    }
+
+    fn gradient_pass(clip: Option<Rect>) -> UiPass {
+        let mut list = DrawList::new();
+        if let Some(clip) = clip {
+            list.push_clip(clip);
+        }
+        let top = [1.0, 0.0, 0.0, 1.0];
+        let bottom = [0.0, 0.0, 1.0, 0.0];
+        list.vertical_gradient(Rect::new(0.0, 0.0, 10.0, 100.0), top, bottom);
+        let mut pass = UiPass::new(100, 100);
+        pass.rebuild(&list, &atlas());
+        pass
+    }
+
+    #[test]
+    fn a_vertical_gradient_is_two_triangles_with_the_edge_colours() {
+        let pass = gradient_pass(None);
+        let vertices = pass.vertices();
+        assert_eq!(vertices.len(), 6);
+        for vertex in vertices {
+            let expected = if vertex.position[1] > 0.0 {
+                [1.0, 0.0, 0.0, 1.0]
+            } else {
+                [0.0, 0.0, 1.0, 0.0]
+            };
+            assert_eq!(vertex.color, expected);
+        }
+    }
+
+    #[test]
+    fn a_clipped_gradient_keeps_its_slope() {
+        let pass = gradient_pass(Some(Rect::new(0.0, 25.0, 100.0, 50.0)));
+        let top = pass
+            .vertices()
+            .iter()
+            .find(|vertex| vertex.position == ndc(0.0, 25.0))
+            .map(|vertex| vertex.color);
+        assert_eq!(top, Some([0.75, 0.0, 0.25, 0.75]));
+    }
+
+    #[test]
+    fn a_gradient_outside_the_clip_draws_nothing() {
+        let pass = gradient_pass(Some(Rect::new(50.0, 0.0, 10.0, 10.0)));
+        assert!(pass.vertices().is_empty());
     }
 
     fn ndc(x: f32, y: f32) -> [f32; 2] {

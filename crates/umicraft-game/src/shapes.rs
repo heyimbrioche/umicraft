@@ -24,6 +24,9 @@
 use glam::DVec3;
 use umicraft_world::{BlockPos, BlockState, World};
 
+use crate::piston_shape;
+use crate::selection::{horizontal_neighbours, pane_connects};
+
 /// Read access to block states by world coordinate.
 ///
 /// The trait exists so the game logic can be driven by any block provider in
@@ -211,8 +214,9 @@ impl Aabb {
 
 /// The maximum number of collision boxes a single block state contributes.
 ///
-/// Stairs and fences need two boxes; nothing in 1.8 needs more.
-pub const MAX_BOXES: usize = 2;
+/// Fences need two boxes, a stair at an inner corner three; nothing in 1.8
+/// needs more.
+pub const MAX_BOXES: usize = 3;
 
 /// The collision geometry of a block state, relative to the block origin.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -266,7 +270,7 @@ impl BlockShape {
     #[must_use]
     pub fn pair(first: Aabb, second: Aabb) -> Self {
         Self {
-            boxes: [first, second],
+            boxes: [first, second, second],
             count: 2,
         }
     }
@@ -314,7 +318,7 @@ enum Kind {
     Stairs,
     /// A fence, wall or fence gate.
     Fence,
-    /// A thin plate (glass pane, iron bars).
+    /// A thin plate (glass pane, iron bars) that reaches its connected neighbours.
     Pane,
     /// A box that covers the full footprint and is `f64` blocks tall.
     Column(f64),
@@ -324,6 +328,23 @@ enum Kind {
     Anvil,
     /// A snow layer, whose height depends on the metadata.
     SnowLayer,
+    /// A chest, trapped chest or ender chest: 0.875 high, inset by a sixteenth
+    /// except towards a neighbouring chest.
+    Chest,
+    /// A piston base, shorter when extended.
+    PistonBase,
+    /// A piston head: plate and rod.
+    PistonHead,
+    /// A skull, whose box follows its facing (the same as its selection box).
+    Skull,
+    /// A door: a thin board that turns with its facing, hinge and open state,
+    /// read from both halves (the same as its selection box).
+    Door,
+    /// A block that collides with exactly its selection box: a ladder, a lily
+    /// pad, a cocoa pod or a flower pot.
+    Bounds,
+    /// The frame of the End portal: a base, and the eye of Ender when set.
+    EndPortalFrame,
 }
 
 /// Classifies a 1.8 block id (and its metadata) into a collision kind.
@@ -346,9 +367,16 @@ fn classify(id: u16, metadata: u8) -> Kind {
         101 | 102 | 160 => Kind::Pane,
         // Trap doors.
         96 | 167 => Kind::Column(0.1875),
-        // Pressure plates, rails, repeaters, comparators, redstone wire and
-        // carpet are one sixteenth high.
-        27 | 28 | 55 | 66 | 70 | 72 | 93 | 94 | 147 | 148 | 149 | 150 | 171 => Kind::Column(0.0625),
+        // No collision box at all: `getCollisionBoundingBox` returns null in
+        // `BlockBush` (the stems 104 and 105 included, with the saplings, the
+        // flowers, the crops...), `BlockRailBase` (rails 27, 28, 66, 157),
+        // `BlockBasePressurePlate` (70, 72, 147, 148), `BlockRedstoneWire` (55)
+        // and `BlockPortal` (90). Their selection boxes are separate.
+        27 | 28 | 55 | 66 | 70 | 72 | 90 | 104 | 105 | 147 | 148 | 157 => Kind::Empty,
+        // Repeaters and comparators (`BlockRedstoneDiode` bounds) are an eighth
+        // high, carpet (`BlockCarpet`) a sixteenth.
+        93 | 94 | 149 | 150 => Kind::Column(0.125),
+        171 => Kind::Column(0.0625),
         // Daylight detectors.
         151 | 178 => Kind::Column(0.375),
         // Cake, bed, enchanting table, brewing stand, cauldron and hopper.
@@ -356,52 +384,25 @@ fn classify(id: u16, metadata: u8) -> Kind {
         26 => Kind::Column(0.5625),
         116..=118 => Kind::Column(0.75),
         154 => Kind::Column(0.625),
+        29 | 33 => Kind::PistonBase,
+        34 => Kind::PistonHead,
+        144 => Kind::Skull,
+        54 | 130 | 146 => Kind::Chest,
         81 => Kind::Cactus,
         145 => Kind::Anvil,
         78 => Kind::SnowLayer,
+        // Wooden, iron and the five other doors: `BlockDoor` collides with the
+        // bounds of its state.
+        64 | 71 | 193..=197 => Kind::Door,
+        // Ladders (`BlockLadder`), lily pads (`BlockLilyPad`), cocoa pods
+        // (`BlockCocoa`) and flower pots (`BlockFlowerPot`) collide with their
+        // bounds, which are their selection bounds.
+        65 | 111 | 127 | 140 => Kind::Bounds,
+        // The frame of the End portal.
+        120 => Kind::EndPortalFrame,
         // Decorations and other blocks without a collision box.
-        6
-        | 29
-        | 30
-        | 31
-        | 32
-        | 34
-        | 35
-        | 36
-        | 37
-        | 38
-        | 39
-        | 40
-        | 50
-        | 51
-        | 59
-        | 63
-        | 64
-        | 65
-        | 68
-        | 69
-        | 71
-        | 75
-        | 76
-        | 77
-        | 83
-        | 106
-        | 111
-        | 115
-        | 119
-        | 120
-        | 127
-        | 131
-        | 132
-        | 140
-        | 141
-        | 142
-        | 143
-        | 144
-        | 175
-        | 176
-        | 177
-        | 193..=197 => Kind::Empty,
+        6 | 30 | 31 | 32 | 36 | 37 | 38 | 39 | 40 | 50 | 51 | 59 | 63 | 68 | 69 | 75 | 76 | 77
+        | 83 | 106 | 115 | 119 | 131 | 132 | 141 | 142 | 143 | 175 | 176 | 177 => Kind::Empty,
         // Everything else is a full cube.
         _ => Kind::Cube,
     }
@@ -440,12 +441,43 @@ pub fn shape_of<S: BlockSource + ?Sized>(
                 ))
             }
         }
-        Kind::SnowLayer => BlockShape::column(f64::from(state.metadata() + 1) / 8.0),
-        Kind::Pane => BlockShape::pair(
-            Aabb::new(DVec3::new(0.0, 0.0, 0.4375), DVec3::new(1.0, 1.0, 0.5625)),
-            Aabb::new(DVec3::new(0.4375, 0.0, 0.0), DVec3::new(0.5625, 1.0, 1.0)),
-        ),
-        Kind::Stairs => stair_shape(state),
+        // `BlockSnow.getCollisionBoundingBox` is `layers - 1` eighths high, one
+        // layer under the selection box (`getBoundsForLayers`): a player
+        // walks onto a single layer and steps up to five.
+        Kind::SnowLayer => BlockShape::column(f64::from(state.metadata() & 7) / 8.0),
+        Kind::Pane => pane_shape(state, world, pos),
+        Kind::PistonBase => piston_shape::base_shape(state.metadata()),
+        Kind::PistonHead => piston_shape::head_shape(state.metadata()),
+        // `BlockSkull.getCollisionBoundingBox` applies
+        // `setBlockBoundsBasedOnState` and returns the block bounds, which
+        // are exactly the selection bounds.
+        Kind::Skull => selection_shape(state, world, pos),
+        // `BlockDoor.getCollisionBoundingBox` applies `setBlockBoundsBasedOnState`
+        // (`combineMetadata` over the two halves) and returns the bounds, which
+        // are exactly the selection bounds.
+        Kind::Door => selection_shape(state, world, pos),
+        // `BlockLadder` and `BlockCocoa` apply `setBlockBoundsBasedOnState` and
+        // return the bounds; `BlockLilyPad` returns its bounds directly and the
+        // flower pot has no override, so the default is its constructor bounds.
+        Kind::Bounds => selection_shape(state, world, pos),
+        // `BlockEndPortalFrame.addCollisionBoxesToList`: the 0.8125 high base,
+        // then the eye (bit 4 of the metadata) as a small box on top.
+        Kind::EndPortalFrame => {
+            let base = Aabb::new(DVec3::ZERO, DVec3::new(1.0, 0.8125, 1.0));
+            if state.metadata() & 4 == 0 {
+                BlockShape::single(base)
+            } else {
+                let eye = Aabb::new(
+                    DVec3::new(0.3125, 0.8125, 0.3125),
+                    DVec3::new(0.6875, 1.0, 0.6875),
+                );
+                BlockShape::pair(base, eye)
+            }
+        }
+        // The chest blocks have no `getCollisionBoundingBox` of their own, so
+        // the collision is their bounds, which are the selection bounds.
+        Kind::Chest => selection_shape(state, world, pos),
+        Kind::Stairs => stair_shape(state, world, pos),
         Kind::Fence => fence_shape(world, pos),
     }
 }
@@ -511,72 +543,168 @@ pub fn is_normal_cube(state: BlockState) -> bool {
 
 /// The shape used for block targeting.
 ///
-/// It is the collision shape of the block, except for decorations: a
-/// decoration has no collision box but must still be targetable, so it falls
-/// back to the full cube. Air is never targetable.
+/// Vanilla targets the block's selection bounds, not its collision boxes, so
+/// this delegates to [`crate::selection::selection_shape`]. Air and liquids
+/// are never targetable.
 #[must_use]
 pub fn selection_shape<S: BlockSource + ?Sized>(
     state: BlockState,
     world: &S,
     pos: BlockPos,
 ) -> BlockShape {
-    let shape = shape_of(state, world, pos);
-    if shape.is_empty() && !state.is_air() {
-        BlockShape::cube()
-    } else {
-        shape
+    crate::selection::selection_shape(state, world, pos)
+}
+
+/// The collision boxes of a glass pane or iron bars.
+///
+/// MCP `BlockPane.addCollisionBoxesToList` (line 75): one thin box per axis.
+/// An axis that is connected on both sides, or on neither side while the
+/// pane is alone, spans the whole block; one connected side reaches the
+/// middle towards that side; and an axis with no connection while the other
+/// has one gets no box at all. The selection box (`setBlockBoundsBasedOnState`)
+/// merges both axes instead, which is why it differs.
+fn pane_shape<S: BlockSource + ?Sized>(state: BlockState, world: &S, pos: BlockPos) -> BlockShape {
+    const LO: f64 = 0.4375;
+    const HI: f64 = 0.5625;
+    let [north, south, west, east] =
+        horizontal_neighbours(world, pos).map(|other| pane_connects(state.id(), other));
+    let any = north || south || west || east;
+    let x_span = pane_span(west, east, any);
+    let z_span = pane_span(north, south, any);
+    let along_x =
+        x_span.map(|(min, max)| Aabb::new(DVec3::new(min, 0.0, LO), DVec3::new(max, 1.0, HI)));
+    let along_z =
+        z_span.map(|(min, max)| Aabb::new(DVec3::new(LO, 0.0, min), DVec3::new(HI, 1.0, max)));
+    match (along_x, along_z) {
+        (Some(x), Some(z)) => BlockShape::pair(x, z),
+        (Some(only), None) | (None, Some(only)) => BlockShape::single(only),
+        (None, None) => BlockShape::EMPTY,
     }
 }
 
-/// The two collision boxes of a stair block.
-///
-/// MCP `BlockStairs.getStateFromMeta` (line 726) maps the metadata to a
-/// facing and a half; `setBaseCollisionBounds` (line 80) gives the lower (or
-/// upper) half of the cube and `func_176306_h` (line 292) the step.
-fn stair_shape(state: BlockState) -> BlockShape {
-    let meta = state.metadata();
-    let top = meta & 4 != 0;
-    let facing = match meta & 3 {
-        0 => StairFacing::East,
-        1 => StairFacing::West,
-        2 => StairFacing::South,
-        _ => StairFacing::North,
-    };
-
-    let base = if top {
-        Aabb::new(DVec3::new(0.0, 0.5, 0.0), DVec3::new(1.0, 1.0, 1.0))
+/// The extent of a pane box along one axis, or `None` when it has no box.
+fn pane_span(negative: bool, positive: bool, any_connection: bool) -> Option<(f64, f64)> {
+    if (negative && positive) || !any_connection {
+        Some((0.0, 1.0))
+    } else if negative {
+        Some((0.0, 0.5))
+    } else if positive {
+        Some((0.5, 1.0))
     } else {
-        Aabb::new(DVec3::ZERO, DVec3::new(1.0, 0.5, 1.0))
+        None
+    }
+}
+
+impl StairFacing {
+    /// The facing of a stair from its metadata (MCP `BlockStairs.getStateFromMeta`).
+    fn from_metadata(metadata: u8) -> Self {
+        match metadata & 3 {
+            0 => Self::East,
+            1 => Self::West,
+            2 => Self::South,
+            _ => Self::North,
+        }
+    }
+
+    /// The `(x, z)` step towards this facing.
+    const fn delta(self) -> (i32, i32) {
+        match self {
+            Self::West => (-1, 0),
+            Self::East => (1, 0),
+            Self::North => (0, -1),
+            Self::South => (0, 1),
+        }
+    }
+}
+
+/// The facing and the half (`true` for the top) of the stair at a position,
+/// `None` for any other block.
+fn stair_at<S: BlockSource + ?Sized>(
+    world: &S,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Option<(StairFacing, bool)> {
+    let state = world.block(x, y, z);
+    matches!(classify(state.id(), state.metadata()), Kind::Stairs).then(|| {
+        (
+            StairFacing::from_metadata(state.metadata()),
+            state.metadata() & 4 != 0,
+        )
+    })
+}
+
+/// The one to three collision boxes of a stair block.
+///
+/// MCP `BlockStairs.addCollisionBoxesToList` (line 533): the base half
+/// (`setBaseCollisionBounds`), then the step (`func_176306_h`), which shrinks
+/// to a quarter when the stair ahead is turned sideways (outer corner), and
+/// when it does not, a quarter behind it (`func_176304_i`) when the stair
+/// behind is turned sideways (inner corner). Both look at the stair of the
+/// same half only, and ignore a corner that a stair like this one already
+/// fills (`isSameStair`).
+fn stair_shape<S: BlockSource + ?Sized>(state: BlockState, world: &S, pos: BlockPos) -> BlockShape {
+    let me = (
+        StairFacing::from_metadata(state.metadata()),
+        state.metadata() & 4 != 0,
+    );
+    let (facing, top) = me;
+    let (fx, fz) = facing.delta();
+    let (base_y, step_y) = if top {
+        ((0.5, 1.0), (0.0, 0.5))
+    } else {
+        ((0.0, 0.5), (0.5, 1.0))
     };
 
-    let step = match (facing, top) {
-        (StairFacing::East, false) => {
-            Aabb::new(DVec3::new(0.5, 0.5, 0.0), DVec3::new(1.0, 1.0, 1.0))
+    let at = |dx: i32, dz: i32| stair_at(world, pos.x + dx, pos.y, pos.z + dz);
+    let same = |dx: i32, dz: i32| at(dx, dz) == Some(me);
+    // The facing of the stair beside, when it is of the same half and turned
+    // sideways to this one.
+    let turned = |dx: i32, dz: i32| {
+        at(dx, dz)
+            .filter(|&(other, half)| {
+                let (ox, oz) = other.delta();
+                half == top && ox * fx + oz * fz == 0
+            })
+            .map(|(other, _)| other.delta())
+    };
+    // The box over the half of the block that `toward` points to, narrowed to
+    // the half that `side` points to.
+    let region = |toward: (i32, i32), side: Option<(i32, i32)>, (y0, y1): (f64, f64)| {
+        let mut min = DVec3::new(0.0, y0, 0.0);
+        let mut max = DVec3::new(1.0, y1, 1.0);
+        for (dx, dz) in std::iter::once(toward).chain(side) {
+            if dx > 0 {
+                min.x = 0.5;
+            } else if dx < 0 {
+                max.x = 0.5;
+            }
+            if dz > 0 {
+                min.z = 0.5;
+            } else if dz < 0 {
+                max.z = 0.5;
+            }
         }
-        (StairFacing::West, false) => {
-            Aabb::new(DVec3::new(0.0, 0.5, 0.0), DVec3::new(0.5, 1.0, 1.0))
-        }
-        (StairFacing::South, false) => {
-            Aabb::new(DVec3::new(0.0, 0.5, 0.5), DVec3::new(1.0, 1.0, 1.0))
-        }
-        (StairFacing::North, false) => {
-            Aabb::new(DVec3::new(0.0, 0.5, 0.0), DVec3::new(1.0, 1.0, 0.5))
-        }
-        (StairFacing::East, true) => {
-            Aabb::new(DVec3::new(0.5, 0.0, 0.0), DVec3::new(1.0, 0.5, 1.0))
-        }
-        (StairFacing::West, true) => {
-            Aabb::new(DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.5, 0.5, 1.0))
-        }
-        (StairFacing::South, true) => {
-            Aabb::new(DVec3::new(0.0, 0.0, 0.5), DVec3::new(1.0, 0.5, 1.0))
-        }
-        (StairFacing::North, true) => {
-            Aabb::new(DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.5, 0.5))
-        }
+        Aabb::new(min, max)
     };
 
-    BlockShape::pair(base, step)
+    let base = region((0, 0), None, base_y);
+    let outer = turned(fx, fz).filter(|&(gx, gz)| !same(-gx, -gz));
+    let step = region((fx, fz), outer, step_y);
+    let inner = if outer.is_none() {
+        turned(-fx, -fz)
+            .filter(|&(gx, gz)| !same(gx, gz))
+            .map(|side| region((-fx, -fz), Some(side), step_y))
+    } else {
+        None
+    };
+    match inner {
+        Some(corner) => BlockShape {
+            boxes: [base, step, corner],
+            count: 3,
+        },
+        None => BlockShape::pair(base, step),
+    }
 }
 
 /// The collision boxes of a fence, wall or fence gate.
@@ -688,6 +816,19 @@ mod tests {
         assert_eq!(shape.boxes()[0].max, DVec3::ONE);
     }
 
+    /// Regression test: wool was listed among the blocks without a collision
+    /// box, so the player fell through every wool floor (a public server's
+    /// lobby, 2026-11-02) and the anti-cheat set the player back.
+    #[test]
+    fn wool_is_a_full_cube_of_every_colour() {
+        let world = TestBlocks::default();
+        for colour in 0..16 {
+            let shape = shape_of(BlockState::new(35, colour), &world, BlockPos::new(0, 0, 0));
+            assert_eq!(shape.boxes().len(), 1, "colour {colour}");
+            assert_eq!(shape.boxes()[0].max, DVec3::ONE);
+        }
+    }
+
     #[test]
     fn air_and_liquids_do_not_collide() {
         let world = TestBlocks::default();
@@ -725,6 +866,60 @@ mod tests {
         assert_eq!(stairs.boxes()[1].max.x, 1.0);
     }
 
+    /// Builds a world of oak stairs `(x, z, metadata)` at y = 0 and returns the
+    /// boxes of the first one as `(min, max)` corners.
+    fn stair_boxes(stairs: &[(i32, i32, u8)]) -> Vec<([f64; 3], [f64; 3])> {
+        let mut world = TestBlocks::default();
+        for &(x, z, metadata) in stairs {
+            world
+                .blocks
+                .insert((x, 0, z), BlockState::new(53, metadata));
+        }
+        let (x, z, metadata) = stairs[0];
+        shape_of(
+            BlockState::new(53, metadata),
+            &world,
+            BlockPos::new(x, 0, z),
+        )
+        .boxes()
+        .iter()
+        .map(|b| (b.min.to_array(), b.max.to_array()))
+        .collect()
+    }
+
+    #[test]
+    fn a_stair_beside_a_sideways_stair_ahead_is_an_outer_corner() {
+        // East stair with a north stair ahead (x = 1) and nothing south of it:
+        // the step shrinks to its north quarter.
+        let boxes = stair_boxes(&[(0, 0, 0), (1, 0, 3)]);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[1], ([0.5, 0.5, 0.0], [1.0, 1.0, 0.5]));
+        // A stair like this one to the south makes it a straight run again.
+        let boxes = stair_boxes(&[(0, 0, 0), (1, 0, 3), (0, 1, 0)]);
+        assert_eq!(boxes[1], ([0.5, 0.5, 0.0], [1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn a_stair_with_a_sideways_stair_behind_is_an_inner_corner() {
+        // East stair with a south stair behind it (x = -1): a third box fills
+        // the south quarter of the back half.
+        let boxes = stair_boxes(&[(0, 0, 0), (-1, 0, 2)]);
+        assert_eq!(boxes.len(), 3);
+        assert_eq!(boxes[1], ([0.5, 0.5, 0.0], [1.0, 1.0, 1.0]));
+        assert_eq!(boxes[2], ([0.0, 0.5, 0.5], [0.5, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn upside_down_stairs_mirror_the_corners_and_ignore_the_other_half() {
+        // Top half (metadata 4): base on top, step below.
+        let boxes = stair_boxes(&[(0, 0, 4), (-1, 0, 6)]);
+        assert_eq!(boxes.len(), 3);
+        assert_eq!(boxes[0], ([0.0, 0.5, 0.0], [1.0, 1.0, 1.0]));
+        assert_eq!(boxes[2], ([0.0, 0.0, 0.5], [0.5, 0.5, 1.0]));
+        // A neighbour of the other half does not make a corner.
+        assert_eq!(stair_boxes(&[(0, 0, 4), (-1, 0, 2)]).len(), 2);
+    }
+
     #[test]
     fn a_lone_fence_is_a_post() {
         let world = TestBlocks::default();
@@ -747,10 +942,173 @@ mod tests {
     }
 
     #[test]
-    fn pressure_plates_are_one_sixteenth_high() {
+    fn plants_rails_plates_wire_and_portals_have_no_collision_box() {
         let world = TestBlocks::default();
-        let plate = shape_of(BlockState::new(70, 0), &world, BlockPos::new(0, 0, 0));
-        assert_eq!(plate.boxes()[0].max.y, 0.0625);
+        let pos = BlockPos::new(0, 0, 0);
+        // The ids of every class whose `getCollisionBoundingBox` is null in
+        // the reference source (`BlockBush` and its subclasses, the rails, the
+        // pressure plates, the redstone wire, the portal), stems included.
+        let ids = [
+            6, 27, 28, 30, 31, 32, 37, 38, 39, 40, 55, 59, 66, 70, 72, 83, 90, 104, 105, 106, 115,
+            141, 142, 147, 148, 157, 175,
+        ];
+        for id in ids {
+            for metadata in [0, 7, 15] {
+                let shape = shape_of(BlockState::new(id, metadata), &world, pos);
+                assert!(shape.is_empty(), "block {id}:{metadata} must not collide");
+            }
+        }
+    }
+
+    /// A door of `id`: the lower half with `lower` metadata at the origin, the
+    /// upper half (bit 8, hinge bit 1 for the left hinge) above it.
+    fn door_world(id: u16, lower: u8, hinge_left: bool) -> TestBlocks {
+        TestBlocks::with(&[
+            (0, 0, 0, BlockState::new(id, lower)),
+            (0, 1, 0, BlockState::new(id, 8 | u8::from(hinge_left))),
+        ])
+    }
+
+    #[test]
+    fn every_door_block_collides_with_a_board_a_sixteenth_and_a_half_thick() {
+        let pos = BlockPos::new(0, 0, 0);
+        for id in [64, 71, 193, 194, 195, 196, 197] {
+            // Closed, facing east: a board on the west side of the block.
+            let world = door_world(id, 0, false);
+            for half in [BlockPos::new(0, 0, 0), BlockPos::new(0, 1, 0)] {
+                let state = world.block(half.x, half.y, half.z);
+                let door = shape_of(state, &world, half);
+                assert_eq!(door.boxes().len(), 1, "door {id}");
+                assert_eq!(door.boxes()[0].max.x, 0.1875, "door {id}");
+                assert_eq!(door.boxes()[0].max.y, 1.0);
+            }
+            let _ = pos;
+        }
+    }
+
+    #[test]
+    fn an_open_door_swings_to_the_side_its_hinge_says() {
+        let pos = BlockPos::new(0, 0, 0);
+        let boards = |hinge_left| {
+            // Open (bit 4), facing east.
+            let world = door_world(64, 4, hinge_left);
+            shape_of(world.block(0, 0, 0), &world, pos).boxes()[0]
+        };
+        let right = boards(false);
+        let left = boards(true);
+        // Right hinge: along the north side; left hinge: along the south side.
+        assert_eq!((right.min.z, right.max.z), (0.0, 0.1875));
+        assert_eq!((left.min.z, left.max.z), (0.8125, 1.0));
+        assert_eq!((right.min.x, right.max.x), (0.0, 1.0));
+    }
+
+    #[test]
+    fn ladders_lily_pads_cocoa_and_flower_pots_collide_with_their_selection_box() {
+        let world = TestBlocks::default();
+        let pos = BlockPos::new(0, 0, 0);
+        for (id, metadata) in [(65, 2), (65, 5), (111, 0), (127, 0), (127, 9), (140, 0)] {
+            let state = BlockState::new(id, metadata);
+            let collision = shape_of(state, &world, pos);
+            let selection = selection_shape(state, &world, pos);
+            assert!(!collision.is_empty(), "block {id}:{metadata}");
+            assert_eq!(collision, selection, "block {id}:{metadata}");
+        }
+    }
+
+    #[test]
+    fn a_ladder_is_a_board_an_eighth_thick_against_its_wall() {
+        let world = TestBlocks::default();
+        // Facing 2 (north): the board lies against the south side.
+        let ladder = shape_of(BlockState::new(65, 2), &world, BlockPos::new(0, 0, 0));
+        let board = ladder.boxes()[0];
+        assert_eq!(board.max.y, 1.0);
+        assert_eq!(board.max.z - board.min.z, 0.125);
+    }
+
+    #[test]
+    fn a_lily_pad_is_a_film_and_a_flower_pot_a_small_block() {
+        let world = TestBlocks::default();
+        let pos = BlockPos::new(0, 0, 0);
+        let pad = shape_of(BlockState::new(111, 0), &world, pos).boxes()[0];
+        assert_eq!(pad.max.y, 0.015_625);
+        let pot = shape_of(BlockState::new(140, 0), &world, pos).boxes()[0];
+        assert_eq!(pot.max.y, 0.375);
+        assert_eq!((pot.min.x, pot.max.x), (0.3125, 0.6875));
+    }
+
+    #[test]
+    fn an_end_portal_frame_has_a_base_and_an_eye_when_it_holds_one() {
+        let world = TestBlocks::default();
+        let pos = BlockPos::new(0, 0, 0);
+        let empty = shape_of(BlockState::new(120, 0), &world, pos);
+        assert_eq!(empty.boxes().len(), 1);
+        assert_eq!(empty.boxes()[0].max.y, 0.8125);
+        let eye = shape_of(BlockState::new(120, 4), &world, pos);
+        assert_eq!(eye.boxes().len(), 2);
+        assert_eq!(eye.boxes()[1].min.y, 0.8125);
+        assert_eq!(eye.boxes()[1].max.y, 1.0);
+        assert_eq!(
+            (eye.boxes()[1].min.x, eye.boxes()[1].max.x),
+            (0.3125, 0.6875)
+        );
+    }
+
+    #[test]
+    fn a_player_cannot_walk_through_a_closed_door() {
+        // The shape is what the collision uses: no longer empty.
+        let world = door_world(64, 0, false);
+        assert!(!shape_of(world.block(0, 0, 0), &world, BlockPos::new(0, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn the_stems_of_pumpkins_and_melons_do_not_block_the_player() {
+        // The bug: 104 and 105 fell through to the full cube.
+        let world = TestBlocks::default();
+        for id in [104, 105] {
+            let stem = BlockState::new(id, 7);
+            assert!(shape_of(stem, &world, BlockPos::new(0, 0, 0)).is_empty());
+            // Still targetable, so the stem can be broken.
+            assert!(!selection_shape(stem, &world, BlockPos::new(0, 0, 0)).is_empty());
+        }
+    }
+
+    #[test]
+    fn repeaters_and_comparators_are_an_eighth_high_and_carpet_a_sixteenth() {
+        let world = TestBlocks::default();
+        let height = |id| {
+            shape_of(BlockState::new(id, 0), &world, BlockPos::new(0, 0, 0)).boxes()[0]
+                .max
+                .y
+        };
+        for id in [93, 94, 149, 150] {
+            assert_eq!(height(id), 0.125, "block {id}");
+        }
+        assert_eq!(height(171), 0.0625);
+    }
+
+    #[test]
+    fn a_snow_layer_collides_one_layer_lower_than_it_is_selected() {
+        let world = TestBlocks::default();
+        let pos = BlockPos::new(0, 0, 0);
+        for layers in 1..=8_u8 {
+            let state = BlockState::new(78, layers - 1);
+            let collision = shape_of(state, &world, pos);
+            let top = collision.boxes().first().map_or(0.0, |b| b.max.y);
+            assert_eq!(top, f64::from(layers - 1) / 8.0, "{layers} layers");
+            let selected = selection_shape(state, &world, pos);
+            assert_eq!(selected.boxes()[0].max.y, f64::from(layers) / 8.0);
+        }
+    }
+
+    #[test]
+    fn a_chest_is_an_inset_box_seven_eighths_high_not_a_full_cube() {
+        let world = TestBlocks::default();
+        for id in [54, 130, 146] {
+            let shape = shape_of(BlockState::new(id, 2), &world, BlockPos::new(0, 0, 0));
+            let chest = shape.boxes()[0];
+            assert_eq!(chest.max.y, 0.875, "chest {id}");
+            assert_eq!((chest.min.x, chest.max.x), (0.0625, 0.9375), "chest {id}");
+        }
     }
 
     #[test]
@@ -761,6 +1119,46 @@ mod tests {
         let selection = selection_shape(torch, &world, BlockPos::new(0, 0, 0));
         assert_eq!(selection.boxes().len(), 1);
         assert!(selection_shape(BlockState::AIR, &world, BlockPos::new(0, 0, 0)).is_empty());
+    }
+
+    #[test]
+    fn skulls_collide_with_their_facing_dependent_box() {
+        let world = TestBlocks::default();
+        let pos = BlockPos::new(0, 0, 0);
+        let floor = shape_of(BlockState::new(144, 1), &world, pos);
+        assert_eq!(floor.boxes().len(), 1);
+        assert_eq!(floor.boxes()[0].max.y, 0.5);
+        let wall = shape_of(BlockState::new(144, 2), &world, pos);
+        assert_eq!(wall.boxes()[0].min.z, 0.5);
+        // The no-drop bit (8) does not change the facing.
+        assert_eq!(shape_of(BlockState::new(144, 9), &world, pos), floor);
+    }
+
+    #[test]
+    fn panes_follow_their_connections() {
+        let pos = BlockPos::new(0, 0, 0);
+        let pane = BlockState::new(102, 0);
+        let alone = shape_of(pane, &TestBlocks::default(), pos);
+        assert_eq!(alone.boxes().len(), 2);
+        // A neighbour to the west only: a half box towards it, nothing on Z.
+        let west = TestBlocks::with(&[(-1, 0, 0, BlockState::new(1, 0))]);
+        let shape = shape_of(pane, &west, pos);
+        assert_eq!(shape.boxes().len(), 1);
+        assert_eq!((shape.boxes()[0].min.x, shape.boxes()[0].max.x), (0.0, 0.5));
+        // Both west and east: one full-length box.
+        let both = TestBlocks::with(&[
+            (-1, 0, 0, BlockState::new(1, 0)),
+            (1, 0, 0, BlockState::new(1, 0)),
+        ]);
+        let shape = shape_of(pane, &both, pos);
+        assert_eq!(shape.boxes().len(), 1);
+        assert_eq!((shape.boxes()[0].min.x, shape.boxes()[0].max.x), (0.0, 1.0));
+        // A corner (west and south) gives two half boxes.
+        let corner = TestBlocks::with(&[
+            (-1, 0, 0, BlockState::new(1, 0)),
+            (0, 0, 1, BlockState::new(1, 0)),
+        ]);
+        assert_eq!(shape_of(pane, &corner, pos).boxes().len(), 2);
     }
 
     #[test]

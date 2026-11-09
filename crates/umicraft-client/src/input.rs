@@ -11,6 +11,8 @@
 
 use std::time::{Duration, Instant};
 
+use umicraft_game::item_use::DropKind;
+
 /// The movement key state, sampled by an input source.
 ///
 /// The axes are the analogue values of the movement keys. The sign of the
@@ -28,6 +30,10 @@ pub struct InputState {
     pub sneak: bool,
     /// Whether the sprint key is held.
     pub sprint: bool,
+    /// Whether the attack / break button is held.
+    pub attack: bool,
+    /// Whether the use (right) button is held.
+    pub use_item: bool,
 }
 
 impl InputState {
@@ -44,6 +50,8 @@ impl InputState {
             jump: false,
             sneak: false,
             sprint: true,
+            attack: false,
+            use_item: false,
         }
     }
 }
@@ -64,8 +72,14 @@ pub struct InputUpdate {
     pub select_slot: Option<u8>,
     /// Whether the player started breaking the targeted block.
     pub break_block: bool,
-    /// Whether the player placed a block against the targeted face.
+    /// Whether the use (right) button went down since the last update.
     pub place_block: bool,
+    /// Whether the pick block (middle) button went down.
+    pub pick_block: bool,
+    /// The drop the player asked for with the drop key, if any.
+    pub drop_item: Option<DropKind>,
+    /// Whether the player pressed the perspective key (`F5`).
+    pub toggle_perspective: bool,
 }
 
 /// The yaw the script turns per update, in radians.
@@ -83,6 +97,8 @@ pub enum ScriptStep {
     Walk,
     /// Walk forward while sprinting.
     Sprint,
+    /// Walk forward while sneaking.
+    Sneak,
     /// Walk forward and jump once a second.
     Jump,
     /// Steer the view down towards the ground in front of the player.
@@ -92,10 +108,29 @@ pub enum ScriptStep {
     /// Turn to the right, so the walk does not run into the block the script
     /// placed.
     Turn,
-    /// Break the block under the crosshair.
+    /// Look around: turn right, then left, alternating every second, while
+    /// the pitch is steered towards the phase's pitch.
+    LookAround,
+    /// Hold the attack button on the block under the crosshair.
     Break,
     /// Place a block against the targeted face.
     Place,
+    /// Sprint forward and click the attack button five times a second: a
+    /// sprinting fight. The vanilla client attacks an entity on each press,
+    /// not while the button is held.
+    Strike,
+    /// Walk forward, jump twice a second and click the attack button five
+    /// times a second: the hits that land on the way down are critical.
+    JumpStrike,
+    /// Hold the use button (a bow drawn, a rod cast, a meal eaten, a sword
+    /// raised).
+    UseItem,
+    /// Press the use button once, for one tick (a pearl or a splash potion
+    /// thrown; holding it would throw again every four ticks).
+    Tap,
+    /// Stand still and select the hotbar slot (0 to 8) a moment after the phase
+    /// starts.
+    Select(u8),
 }
 
 /// One phase of a scripted session.
@@ -123,9 +158,25 @@ pub struct Script {
     pitch: f32,
     fired: bool,
     last_jump: Instant,
+    last_click: Instant,
 }
 
+/// How long into a [`ScriptStep::Select`] phase the slot is selected.
+const SELECT_DELAY: Duration = Duration::from_millis(100);
+
+/// The time between two clicks of a fight (five clicks a second).
+const CLICK_PERIOD: Duration = Duration::from_millis(200);
+
 impl Script {
+    /// Whether a click of the attack button is due; if so, it is taken.
+    fn click_due(&mut self, now: Instant) -> bool {
+        let due = now.duration_since(self.last_click) >= CLICK_PERIOD;
+        if due {
+            self.last_click = now;
+        }
+        due
+    }
+
     /// Creates a script from its phases.
     ///
     /// An empty list is replaced by [`default_script`], so the script always
@@ -144,6 +195,8 @@ impl Script {
             pitch: 0.0,
             fired: false,
             last_jump: Instant::now(),
+            // Far enough in the past for the first click to come at once.
+            last_click: Instant::now() - CLICK_PERIOD,
         }
     }
 
@@ -186,6 +239,10 @@ impl Script {
                 update.state.forward = 1.0;
                 update.state.sprint = true;
             }
+            ScriptStep::Sneak => {
+                update.state.forward = 1.0;
+                update.state.sneak = true;
+            }
             ScriptStep::Jump => {
                 update.state.forward = 1.0;
                 if now.duration_since(self.last_jump) >= Duration::from_millis(500) {
@@ -199,7 +256,18 @@ impl Script {
                 // does not run into the block it placed.
                 update.look_yaw = TURN_RATE;
             }
+            ScriptStep::LookAround => {
+                let second = now.duration_since(self.phase_started).as_secs();
+                update.look_yaw = if second.is_multiple_of(2) {
+                    TURN_RATE
+                } else {
+                    -TURN_RATE
+                };
+            }
             ScriptStep::Break => {
+                // Hold the button for the whole phase: a block takes
+                // several ticks to dig and releasing aborts the dig.
+                update.state.attack = true;
                 if !self.fired {
                     self.fired = true;
                     break_block = true;
@@ -209,6 +277,34 @@ impl Script {
                 if !self.fired {
                     self.fired = true;
                     place_block = true;
+                }
+            }
+            ScriptStep::Strike => {
+                update.state.forward = 1.0;
+                update.state.sprint = true;
+                break_block = self.click_due(now);
+            }
+            ScriptStep::JumpStrike => {
+                update.state.forward = 1.0;
+                break_block = self.click_due(now);
+                if now.duration_since(self.last_jump) >= Duration::from_millis(500) {
+                    self.last_jump = now;
+                    update.state.jump = true;
+                }
+            }
+            ScriptStep::UseItem => update.state.use_item = true,
+            ScriptStep::Tap => {
+                update.state.use_item = !self.fired;
+                self.fired = true;
+            }
+            ScriptStep::Select(slot) => {
+                // Later than the phase start, so that a use released
+                // by the same phase sends its release first, as a player who
+                // lets go of the button and then presses a number key.
+                let started = now.duration_since(self.phase_started);
+                if !self.fired && started >= SELECT_DELAY {
+                    self.fired = true;
+                    update.select_slot = Some(slot);
                 }
             }
         }
@@ -301,6 +397,66 @@ pub fn default_script() -> Vec<ScriptPhase> {
     phases
 }
 
+/// The 60-second movement script of the parity harness (ROADMAP.md P0):
+/// stand, walk, sneak, sprint, jump, look around, walk, stand.
+///
+/// The owner plays the same timeline by hand with the vanilla client
+/// (`docs/parity-harness.md`), so the two serverbound traces can be compared
+/// with `umicraft-trace-diff`. Changing a phase here means changing that
+/// document too.
+#[must_use]
+pub fn movement_script() -> Vec<ScriptPhase> {
+    let phase = |step, seconds, pitch| ScriptPhase {
+        step,
+        duration: Duration::from_secs(seconds),
+        pitch,
+    };
+    vec![
+        phase(ScriptStep::Idle, 5, 0.0),
+        phase(ScriptStep::Walk, 8, 0.0),
+        phase(ScriptStep::Sneak, 8, 0.0),
+        phase(ScriptStep::Sprint, 8, 0.0),
+        phase(ScriptStep::Jump, 8, 0.0),
+        phase(ScriptStep::LookAround, 5, 0.5),
+        phase(ScriptStep::LookAround, 5, -0.5),
+        phase(ScriptStep::Walk, 8, 0.0),
+        phase(ScriptStep::Idle, 5, 0.0),
+    ]
+}
+
+/// The scripted 1v1: the player walks up to an opponent and fights, with a
+/// pause to draw a bow, cast a rod or eat.
+///
+/// The owner plays the same timeline by hand with the vanilla client against
+/// the same opponent (`docs/parity-harness.md`, "Combat script"). Changing a
+/// phase here means changing that document too.
+#[must_use]
+pub fn combat_script() -> Vec<ScriptPhase> {
+    let phase = |step, seconds| ScriptPhase {
+        step,
+        duration: Duration::from_secs(seconds),
+        pitch: 0.0,
+    };
+    use ScriptStep::{Idle, JumpStrike, Select, Sprint, Strike, Tap, UseItem};
+    // Hotbar: 0 sword, 1 bow, 2 ender pearl, 3 splash potion.
+    vec![
+        phase(Select(0), 5),
+        phase(Sprint, 4),
+        phase(Strike, 10),
+        phase(Select(1), 3),
+        phase(UseItem, 5),
+        phase(Select(0), 3),
+        phase(Strike, 10),
+        phase(JumpStrike, 10),
+        phase(UseItem, 3),
+        phase(Select(2), 1),
+        phase(Tap, 1),
+        phase(Select(3), 1),
+        phase(Tap, 1),
+        phase(Idle, 3),
+    ]
+}
+
 /// The scripted session that only stands still.
 ///
 /// It is used to measure the idle traffic of a session (the keepalives and
@@ -353,6 +509,101 @@ mod tests {
         }
         assert!(saw_break, "the break phase must request a dig");
         assert!(saw_place, "the place phase must request a placement");
+    }
+
+    #[test]
+    fn the_combat_script_lasts_sixty_seconds_and_fights() {
+        let total: Duration = combat_script().iter().map(|phase| phase.duration).sum();
+        assert_eq!(total, Duration::from_secs(60));
+        let state_in = |step| {
+            let mut script = Script::new(vec![ScriptPhase {
+                step,
+                duration: Duration::from_secs(10),
+                pitch: 0.0,
+            }]);
+            script.update(Instant::now()).state
+        };
+        let strike = state_in(ScriptStep::Strike);
+        assert!(strike.sprint && strike.forward == 1.0);
+        assert!(state_in(ScriptStep::UseItem).use_item);
+        assert!(!state_in(ScriptStep::UseItem).attack);
+        // A fight clicks five times a second, one press at a time.
+        let mut script = Script::new(vec![ScriptPhase {
+            step: ScriptStep::Strike,
+            duration: Duration::from_secs(10),
+            pitch: 0.0,
+        }]);
+        let start = Instant::now();
+        let clicks = (0..100u64)
+            .filter(|tick| {
+                script
+                    .update(start + Duration::from_millis(tick * 50))
+                    .break_block
+            })
+            .count();
+        assert!((24..=26).contains(&clicks), "{clicks}");
+    }
+
+    #[test]
+    fn a_tap_presses_use_once_and_a_select_picks_the_slot_once() {
+        let phase = |step| ScriptPhase {
+            step,
+            duration: Duration::from_secs(10),
+            pitch: 0.0,
+        };
+        let start = Instant::now();
+        let mut tap = Script::new(vec![phase(ScriptStep::Tap)]);
+        assert!(tap.update(start).state.use_item);
+        assert!(!tap.update(start + Duration::from_millis(50)).state.use_item);
+        let mut select = Script::new(vec![phase(ScriptStep::Select(3))]);
+        assert_eq!(select.update(start).select_slot, None);
+        let picked = select.update(start + Duration::from_millis(150));
+        assert_eq!(picked.select_slot, Some(3));
+        let again = select.update(start + Duration::from_millis(200));
+        assert_eq!(again.select_slot, None);
+    }
+
+    #[test]
+    fn the_combat_script_selects_every_weapon_it_uses() {
+        let slots: Vec<u8> = combat_script()
+            .iter()
+            .filter_map(|phase| match phase.step {
+                ScriptStep::Select(slot) => Some(slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slots, [0, 1, 0, 2, 3]);
+    }
+
+    #[test]
+    fn the_movement_script_lasts_sixty_seconds() {
+        let total: Duration = movement_script().iter().map(|phase| phase.duration).sum();
+        assert_eq!(total, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_sneak_phase_sneaks_forward() {
+        let mut script = Script::new(vec![ScriptPhase {
+            step: ScriptStep::Sneak,
+            duration: Duration::from_secs(10),
+            pitch: 0.0,
+        }]);
+        let update = script.update(Instant::now());
+        assert_eq!(update.state.forward, 1.0);
+        assert!(update.state.sneak);
+    }
+
+    #[test]
+    fn the_look_around_phase_turns_both_ways() {
+        let mut script = Script::new(vec![ScriptPhase {
+            step: ScriptStep::LookAround,
+            duration: Duration::from_secs(10),
+            pitch: 0.0,
+        }]);
+        let start = Instant::now();
+        let right = script.update(start).look_yaw;
+        let left = script.update(start + Duration::from_millis(1500)).look_yaw;
+        assert!(right > 0.0 && left < 0.0, "{right} then {left}");
     }
 
     #[test]

@@ -12,12 +12,14 @@ use glam::{Mat4, Vec3};
 use umicraft_assets::skin::{
     procedural_cow_texture, procedural_fallback_skin, procedural_zombie_skin, SkinModel,
 };
-use umicraft_game::entity::{EntityFlags, EntityId, EntityKind, EntityRenderSnapshot};
-use umicraft_model::entity::{emit_block_item_cube, HumanoidModel, ModelVertex, QuadrupedModel};
-use umicraft_render::{Camera, EntityVertex, HudLayout, Overlay, RenderEnvironment, Renderer};
+use umicraft_game::entity::{EntityFlags, EntityId, EntityItem, EntityKind, EntityRenderSnapshot};
+use umicraft_model::entity::{
+    emit_block_item_cube, HumanoidModel, HumanoidPose, ModelVertex, QuadrupedModel,
+};
+use umicraft_render::{Camera, EntityVertex, RenderEnvironment, Renderer};
 
 use crate::args::{Args, DemoView};
-use crate::entity_textures::{
+use crate::entity_render::{
     load_or_fallback, mesh_entities, procedural_dirt_texture, EntityTextures,
 };
 use crate::error::ClientError;
@@ -155,7 +157,7 @@ pub fn build_demo_scene() -> DemoScene {
 
     // 1. Steve (HumanoidModel, classic 4px arms, dual-layer skin)
     let mut steve_model = HumanoidModel::new(false);
-    steve_model.set_angles(0.0, 0.0, 0.0, 0.0, false);
+    steve_model.set_pose(&walking_pose(0.0, 0.0, 0.0, 0.0, false));
     let steve_pos = Vec3::new(5.0, 64.0, 6.0);
     let steve_mesh = steve_model.emit_mesh();
     let steve_count = steve_mesh.len();
@@ -172,7 +174,7 @@ pub fn build_demo_scene() -> DemoScene {
 
     // 2. Alex (HumanoidModel, slim 3px arms, walking animation pose)
     let mut alex_model = HumanoidModel::new(true);
-    alex_model.set_angles(1.0, 0.8, 15.0, 5.0, false);
+    alex_model.set_pose(&walking_pose(1.0, 0.8, 15.0, 5.0, false));
     let alex_pos = Vec3::new(7.0, 64.0, 6.0);
     let alex_mesh = alex_model.emit_mesh();
     let alex_count = alex_mesh.len();
@@ -189,7 +191,7 @@ pub fn build_demo_scene() -> DemoScene {
 
     // 3. Zombie (HumanoidModel biped, zombie arms forward)
     let mut zombie_model = HumanoidModel::zombie();
-    zombie_model.set_angles(0.0, 0.0, 0.0, 0.0, true);
+    zombie_model.set_pose(&walking_pose(0.0, 0.0, 0.0, 0.0, true));
     let zombie_pos = Vec3::new(9.0, 64.0, 6.0);
     let zombie_mesh = zombie_model.emit_mesh();
     let zombie_count = zombie_mesh.len();
@@ -286,7 +288,7 @@ pub fn build_walk_cycle_scene() -> DemoScene {
 
     // 1. Steve Step A (limb_swing = 0.0, speed = 0.6) -> Right leg forward, left arm forward
     let mut steve_a = HumanoidModel::new(false);
-    steve_a.set_angles(0.0, 0.6, 0.0, 0.0, false);
+    steve_a.set_pose(&walking_pose(0.0, 0.6, 0.0, 0.0, false));
     let pos_a = Vec3::new(2.0, 64.0, 6.0);
     for mv in steve_a.emit_mesh() {
         steve_verts.push(to_render_vertex_rot(mv, rot, pos_a));
@@ -300,7 +302,7 @@ pub fn build_walk_cycle_scene() -> DemoScene {
 
     // 2. Alex Passing Neutral (limb_swing = 2.358, speed = 0.6) -> Legs cross vertically
     let mut alex_mid = HumanoidModel::new(true);
-    alex_mid.set_angles(2.358, 0.6, 0.0, 0.0, false);
+    alex_mid.set_pose(&walking_pose(2.358, 0.6, 0.0, 0.0, false));
     let pos_mid = Vec3::new(5.0, 64.0, 6.0);
     for mv in alex_mid.emit_mesh() {
         alex_verts.push(to_render_vertex_rot(mv, rot, pos_mid));
@@ -314,7 +316,7 @@ pub fn build_walk_cycle_scene() -> DemoScene {
 
     // 3. Steve Step B (limb_swing = 4.716, speed = 0.6) -> Left leg forward, right arm forward
     let mut steve_b = HumanoidModel::new(false);
-    steve_b.set_angles(4.716, 0.6, 0.0, 0.0, false);
+    steve_b.set_pose(&walking_pose(4.716, 0.6, 0.0, 0.0, false));
     let pos_b = Vec3::new(8.0, 64.0, 6.0);
     for mv in steve_b.emit_mesh() {
         steve_verts.push(to_render_vertex_rot(mv, rot, pos_b));
@@ -385,6 +387,33 @@ pub fn build_walk_cycle_scene() -> DemoScene {
     }
 }
 
+/// A humanoid pose with the inputs the demo scenes vary.
+fn walking_pose(
+    limb_swing: f32,
+    limb_swing_amount: f32,
+    head_yaw: f32,
+    head_pitch: f32,
+    arms_forward: bool,
+) -> HumanoidPose {
+    HumanoidPose {
+        limb_swing,
+        limb_swing_amount,
+        head_yaw,
+        head_pitch,
+        arms_forward,
+        ..HumanoidPose::default()
+    }
+}
+
+/// Turns a snapshot to `yaw_deg` away from the camera's facing direction:
+/// the demo cameras look towards +Z, so an entity faces them at yaw 180.
+fn face_the_camera(snapshot: &mut EntityRenderSnapshot, yaw_deg: f32) {
+    let yaw = 180.0 + yaw_deg;
+    snapshot.yaw = yaw;
+    snapshot.body_yaw = yaw;
+    snapshot.head_yaw = yaw;
+}
+
 fn make_snapshot(
     id: i32,
     kind: EntityKind,
@@ -394,19 +423,52 @@ fn make_snapshot(
     EntityRenderSnapshot {
         id: EntityId(id),
         kind,
+        light: umicraft_world::LightLevel::FULL_SKY,
+        origin: glam::DVec3::ZERO,
         position: pos,
-        yaw: 0.0,
+        yaw: 180.0,
+        body_yaw: 180.0,
         pitch: 0.0,
-        head_yaw: 0.0,
+        head_yaw: 180.0,
         limb_swing: 0.0,
         limb_swing_amount: 0.0,
+        swing_progress: 0.0,
+        fuse_flash: 0.0,
+        hurt: false,
+        death_time: 0.0,
+        bed: None,
+        meta: Default::default(),
+        cape: Default::default(),
+        name_tag: None,
+        profile: None,
         uuid,
-        held_item: None,
-        flags: EntityFlags::default(),
+        held: None,
+        armor: [None, None, None, None],
+        spectator: false,
+        object_data: 0,
+        shadow: Default::default(),
+        item: None,
+        age: 0.0,
+        frame_direction: 0,
+        frame_rotation: 0,
+        use_ticks: 0,
+        fishing: false,
+        riding: false,
+        leash: None,
+        flight: None,
+        squish: 0.0,
+        squid: Default::default(),
+        horse: None,
+        ridden: false,
+        block_lights: std::sync::Arc::default(),
+        rod_tip: None,
+        local: false,
+        ghost_visible: false,
+        flags: EntityFlags::new(0, 0x7F),
     }
 }
 
-/// Builds an exhibition scene featuring all 29 Minecraft 1.8 mobs plus Steve, Alex, and Dropped Item.
+/// Builds an exhibition scene featuring all 29 Minecraft 1.8 mobs plus Steve and Alex.
 #[must_use]
 pub fn build_all_mobs_scene() -> (Vec<EntityRenderSnapshot>, EntityDemoReport) {
     let mut snapshots = Vec::new();
@@ -517,17 +579,6 @@ pub fn build_all_mobs_scene() -> (Vec<EntityRenderSnapshot>, EntityDemoReport) {
         model_kind: "Ender Dragon boss",
         vertex_count: 0,
     });
-    id += 1;
-
-    // Dropped Item
-    let item_pos = Vec3::new(0.0, 64.25, 1.0);
-    snapshots.push(make_snapshot(id, EntityKind::Item, item_pos, None));
-    summaries.push(EntitySummary {
-        name: "Dropped Item",
-        position: [item_pos.x, item_pos.y, item_pos.z],
-        model_kind: "Floating item cuboid",
-        vertex_count: 0,
-    });
 
     let batches = mesh_entities(&snapshots);
     let total_vertices: usize = batches.values().map(|v| v.len()).sum();
@@ -571,7 +622,7 @@ pub struct MobCatalogEntry {
     pub yaw_deg: f32,
 }
 
-/// Catalog of all 36 Minecraft 1.8 entities with tailored camera framing.
+/// Catalog of all 35 Minecraft 1.8 entities with tailored camera framing.
 pub static MOB_CATALOG: &[MobCatalogEntry] = &[
     MobCatalogEntry {
         id: "chicken",
@@ -919,10 +970,10 @@ pub static MOB_CATALOG: &[MobCatalogEntry] = &[
         display_name: "Ghast",
         kind: EntityKind::Ghast,
         uuid: None,
-        world_y_offset: 2.0,
-        camera_dist: 9.0,
-        camera_y: 3.50,
-        camera_pitch: -0.08,
+        world_y_offset: 0.0,
+        camera_dist: 17.0,
+        camera_y: 2.0,
+        camera_pitch: -0.02,
         yaw_deg: 25.0,
     },
     MobCatalogEntry {
@@ -930,10 +981,10 @@ pub static MOB_CATALOG: &[MobCatalogEntry] = &[
         display_name: "Wither",
         kind: EntityKind::Wither,
         uuid: None,
-        world_y_offset: 1.0,
-        camera_dist: 4.5,
-        camera_y: 1.80,
-        camera_pitch: -0.06,
+        world_y_offset: 0.0,
+        camera_dist: 9.0,
+        camera_y: 2.4,
+        camera_pitch: -0.02,
         yaw_deg: 25.0,
     },
     MobCatalogEntry {
@@ -958,17 +1009,6 @@ pub static MOB_CATALOG: &[MobCatalogEntry] = &[
         camera_pitch: -0.26,
         yaw_deg: 38.0,
     },
-    MobCatalogEntry {
-        id: "item",
-        display_name: "Dropped Item",
-        kind: EntityKind::Item,
-        uuid: None,
-        world_y_offset: 0.25,
-        camera_dist: 1.4,
-        camera_y: 0.35,
-        camera_pitch: -0.15,
-        yaw_deg: 25.0,
-    },
 ];
 
 /// Finds a mob entry by query string, accepting aliases and ignoring case/spaces/dashes.
@@ -987,9 +1027,75 @@ pub fn find_mob(query: &str) -> Option<&'static MobCatalogEntry> {
             || (m.id == "magma_cube" && clean == "magma")
             || (m.id == "snowman" && clean == "snowgolem")
             || (m.id == "zombie_pigman" && clean == "pigman")
-            || (m.id == "item" && (clean == "droppeditem" || clean == "dirt"))
     })
 }
+
+/// The skull type a biped wears in the dump, a different one for each:
+/// skeleton, wither skeleton, zombie, player and creeper.
+fn skull_type(mob: &MobCatalogEntry) -> Option<i16> {
+    match mob.display_name {
+        "Steve" => Some(0),
+        "Alex" => Some(4),
+        "Zombie" => Some(1),
+        "Skeleton" => Some(3),
+        "Zombie Pigman" => Some(2),
+        _ => None,
+    }
+}
+
+/// What a mob wears in the dump: nothing, armour, or flames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Plain,
+    Armored,
+    Burning,
+    Chested,
+    Sitting,
+    Glowing,
+    Skull,
+    Arrows,
+    Ghost,
+    Spectator,
+    Spawning,
+    Cave,
+    Shadow,
+}
+
+/// A different set of armour per mob, to see every material in the dump:
+/// diamond, iron, gold, chainmail, then red-dyed leather.
+fn demo_armor(index: usize) -> [Option<EntityItem>; 4] {
+    const FIRST_ITEM: [i16; 5] = [310, 306, 314, 302, 298];
+    let first = FIRST_ITEM[index % FIRST_ITEM.len()];
+    // Item ids run helmet, chestplate, leggings, boots; the slots run boots first.
+    let piece = |offset: i16| {
+        let leather = first == 298;
+        Some(EntityItem {
+            item_id: first + offset,
+            damage: 0,
+            count: 1,
+            nbt: if leather {
+                Some(std::sync::Arc::from(RED_LEATHER))
+            } else if first == 310 {
+                Some(std::sync::Arc::from(ENCHANTED))
+            } else {
+                None
+            },
+        })
+    };
+    [piece(3), piece(2), piece(1), piece(0)]
+}
+
+/// NBT of `{ench: [{id: 16, lvl: 1}]}`: an enchanted piece with a glint.
+const ENCHANTED: &[u8] = &[
+    10, 0, 0, 9, 0, 4, b'e', b'n', b'c', b'h', 10, 0, 0, 0, 1, 2, 0, 2, b'i', b'd', 0, 16, 2, 0, 3,
+    b'l', b'v', b'l', 0, 1, 0, 0,
+];
+
+/// NBT of `{display: {color: 0xCC2222}}`.
+const RED_LEATHER: &[u8] = &[
+    10, 0, 0, 10, 0, 7, b'd', b'i', b's', b'p', b'l', b'a', b'y', 3, 0, 5, b'c', b'o', b'l', b'o',
+    b'r', 0, 0xCC, 0x22, 0x22, 0, 0,
+];
 
 /// Renders every single entity in [`MOB_CATALOG`] one by one into the given directory.
 ///
@@ -1004,7 +1110,7 @@ pub fn dump_all_mobs(args: &Args, output_dir: &std::path::Path) -> Result<(), Cl
     })?;
 
     println!(
-        "Rendering all 36 Minecraft 1.8 entities 1-by-1 to {}...",
+        "Rendering all 35 Minecraft 1.8 entities 1-by-1 to {}...",
         output_dir.display()
     );
 
@@ -1025,22 +1131,172 @@ pub fn dump_all_mobs(args: &Args, output_dir: &std::path::Path) -> Result<(), Cl
         "CLEAN-ROOM PROCEDURAL TEXTURES"
     };
 
-    for (index, mob) in MOB_CATALOG.iter().enumerate() {
+    // The dump camera looks towards +Z, so the flames face -Z.
+    entity_textures.set_view_yaw(std::f32::consts::PI);
+    let variants = MOB_CATALOG
+        .iter()
+        .enumerate()
+        .flat_map(|(index, mob)| {
+            let armored = matches!(
+                mob.kind,
+                EntityKind::Player
+                    | EntityKind::Zombie
+                    | EntityKind::Skeleton
+                    | EntityKind::ZombiePigman
+                    | EntityKind::Giant
+                    | EntityKind::Pig
+                    | EntityKind::Horse
+            );
+            let burning = matches!(
+                mob.kind,
+                EntityKind::Zombie | EntityKind::Cow | EntityKind::Creeper | EntityKind::Giant
+            );
+            let chested = mob.kind == EntityKind::Horse;
+            let sitting = matches!(mob.kind, EntityKind::Wolf | EntityKind::Ocelot);
+            let glowing = matches!(mob.kind, EntityKind::Creeper | EntityKind::Wither);
+            let skull = skull_type(mob).is_some();
+            let arrowed = mob.kind == EntityKind::Player;
+            let ghost = matches!(mob.kind, EntityKind::Player | EntityKind::Cow);
+            let spawning = mob.kind == EntityKind::Wither;
+            let shadowed = matches!(
+                mob.kind,
+                EntityKind::Player | EntityKind::Cow | EntityKind::Pig | EntityKind::Spider
+            );
+            let cave = matches!(
+                mob.kind,
+                EntityKind::Zombie | EntityKind::Cow | EntityKind::Blaze | EntityKind::Player
+            );
+            [(index, mob, Look::Plain)]
+                .into_iter()
+                .chain(armored.then_some((index, mob, Look::Armored)))
+                .chain(burning.then_some((index, mob, Look::Burning)))
+                .chain(chested.then_some((index, mob, Look::Chested)))
+                .chain(sitting.then_some((index, mob, Look::Sitting)))
+                .chain(glowing.then_some((index, mob, Look::Glowing)))
+                .chain(skull.then_some((index, mob, Look::Skull)))
+                .chain(arrowed.then_some((index, mob, Look::Arrows)))
+                .chain(ghost.then_some((index, mob, Look::Ghost)))
+                .chain(spawning.then_some((index, mob, Look::Spawning)))
+                .chain(shadowed.then_some((index, mob, Look::Shadow)))
+                .chain(cave.then_some((index, mob, Look::Cave)))
+                .chain(arrowed.then_some((index, mob, Look::Spectator)))
+        })
+        .collect::<Vec<_>>();
+    for (index, mob, look) in variants {
         let pos = Vec3::new(0.0, 64.0 + mob.world_y_offset, 0.0);
         let mut snapshot = make_snapshot((index + 1) as i32, mob.kind, pos, mob.uuid);
-        snapshot.yaw = mob.yaw_deg;
-        snapshot.head_yaw = mob.yaw_deg;
+        face_the_camera(&mut snapshot, mob.yaw_deg);
+        if look == Look::Burning {
+            snapshot.flags = EntityFlags::new(0x01, 0x7F);
+        }
+        // The glow layers move with the age: pick a tick away from zero.
+        snapshot.age = 37.0;
+        // An invisible entity is seen by a spectator, who sees it translucent.
+        if matches!(look, Look::Ghost | Look::Spectator) {
+            snapshot.flags = EntityFlags::new(0x20, 0x7F);
+        }
+        if look == Look::Shadow {
+            // A floor of full blocks under the mob, in daylight.
+            let size =
+                umicraft_game::entity::shadow::shadow_size(mob.kind, false, &snapshot.meta.variant);
+            let floor = (64.0 + mob.world_y_offset).floor() as i32;
+            snapshot.shadow = umicraft_game::entity::shadow::shadow_blocks_with(
+                snapshot.position.as_dvec3(),
+                size,
+                0,
+                |pos| pos.y < floor,
+                |_| umicraft_world::LightLevel::FULL_SKY,
+            )
+            .into();
+        }
+        entity_textures.set_camera_position(Vec3::new(0.0, 64.0 + mob.camera_y, -mob.camera_dist));
+        if look == Look::Cave {
+            // A dim cave: a little block light and no sky light.
+            snapshot.light = umicraft_world::LightLevel { block: 3, sky: 0 };
+        }
+        if look == Look::Spawning {
+            snapshot.meta.variant =
+                umicraft_game::entity::meta::Variant::Wither { invulnerable: 150 };
+        }
+        if look == Look::Spectator {
+            snapshot.spectator = true;
+        }
+        entity_textures.set_viewer_spectator(matches!(look, Look::Ghost | Look::Spectator));
+        if look == Look::Arrows {
+            snapshot.meta.living.arrows = 12;
+        }
+        if look == Look::Skull {
+            snapshot.armor[3] = skull_type(mob).map(|damage| EntityItem {
+                item_id: 397,
+                damage,
+                count: 1,
+                nbt: None,
+            });
+        }
+        if look == Look::Glowing {
+            use umicraft_game::entity::meta::{CreeperMeta, Variant};
+            match mob.kind {
+                EntityKind::Creeper => {
+                    snapshot.meta.variant = Variant::Creeper(CreeperMeta {
+                        powered: true,
+                        ..CreeperMeta::default()
+                    });
+                }
+                _ => snapshot.meta.living.health = 100.0,
+            }
+        }
+        if look == Look::Sitting {
+            use umicraft_game::entity::meta::{OcelotMeta, Variant, WolfMeta};
+            snapshot.meta.variant = match mob.kind {
+                EntityKind::Wolf => Variant::Wolf(WolfMeta {
+                    sitting: true,
+                    tamed: true,
+                    ..WolfMeta::default()
+                }),
+                _ => Variant::Ocelot(OcelotMeta {
+                    sitting: true,
+                    tamed: true,
+                    ..OcelotMeta::default()
+                }),
+            };
+        }
+        if look == Look::Chested {
+            snapshot.meta.variant = umicraft_game::entity::meta::Variant::Horse(
+                umicraft_game::entity::meta::HorseMeta {
+                    kind: 1,
+                    variant: 0,
+                    armor: 0,
+                    flags: 4 | 8,
+                },
+            );
+        }
+        if look == Look::Armored {
+            snapshot.armor = demo_armor(index);
+            if mob.kind == EntityKind::Horse {
+                snapshot.meta.variant = umicraft_game::entity::meta::Variant::Horse(
+                    umicraft_game::entity::meta::HorseMeta {
+                        kind: 0,
+                        variant: 0x0102,
+                        armor: 3,
+                        flags: 4,
+                    },
+                );
+            }
+            if mob.kind == EntityKind::Pig {
+                snapshot.meta.variant = umicraft_game::entity::meta::Variant::Pig { saddled: true };
+            }
+        }
 
-        let batches = mesh_entities(&[snapshot]);
+        let batches = mesh_entities(&[snapshot.clone()]);
         let total_vertices: usize = batches.values().map(|v| v.len()).sum();
 
         entity_textures.mesh_and_upload(&[snapshot], &mut renderer);
 
         let eye = Vec3::new(0.0, 64.0 + mob.camera_y, -mob.camera_dist);
         let mut camera = Camera::new(eye, std::f32::consts::PI, mob.camera_pitch);
+        camera.pin_render_origin(glam::DVec3::ZERO);
         camera.set_aspect(args.width, args.height);
 
-        let mut overlay = Overlay::new(args.width, args.height);
         let lines = [
             format!(
                 "UMICRAFT M8 // ENTITY SHOWCASE // {}",
@@ -1049,11 +1305,29 @@ pub fn dump_all_mobs(args: &Args, output_dir: &std::path::Path) -> Result<(), Cl
             format!("1 ENTITY // {} VERTICES", total_vertices),
             texture_info.to_string(),
         ];
-        draw_caption(&mut overlay, &lines, args.width, args.height);
-
-        renderer.render(&camera, &overlay)?;
+        crate::caption::render_captioned(
+            &mut renderer,
+            &camera,
+            &lines,
+            (args.width, args.height),
+        )?;
         let image = renderer.read_pixels()?;
-        let out_path = output_dir.join(format!("{}.png", mob.id));
+        let suffix = match look {
+            Look::Plain => "",
+            Look::Armored => "_armored",
+            Look::Burning => "_burning",
+            Look::Chested => "_chested",
+            Look::Sitting => "_sitting",
+            Look::Glowing => "_glowing",
+            Look::Skull => "_skull",
+            Look::Arrows => "_arrows",
+            Look::Ghost => "_ghost",
+            Look::Spawning => "_spawning",
+            Look::Cave => "_cave",
+            Look::Shadow => "_shadow",
+            Look::Spectator => "_spectator",
+        };
+        let out_path = output_dir.join(format!("{}{suffix}.png", mob.id));
         write_png(&out_path, &image.rgba, image.width, image.height)?;
 
         println!(
@@ -1067,7 +1341,7 @@ pub fn dump_all_mobs(args: &Args, output_dir: &std::path::Path) -> Result<(), Cl
     }
 
     println!(
-        "\nSuccessfully rendered all 36 entities 1-by-1 to {}!",
+        "\nSuccessfully rendered all 35 entities 1-by-1 to {}!",
         output_dir.display()
     );
     Ok(())
@@ -1112,7 +1386,7 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
 
     if let Some(mob_query) = args.mob.as_deref() {
         if mob_query.eq_ignore_ascii_case("list") {
-            println!("=== UMICRAFT M8 ENTITY CATALOG (36 ENTITIES) ===");
+            println!("=== UMICRAFT M8 ENTITY CATALOG (35 ENTITIES) ===");
             for (idx, m) in MOB_CATALOG.iter().enumerate() {
                 println!(
                     "  {:2}. {:<16} [id: {:<14}] (kind: {:?})",
@@ -1127,16 +1401,15 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
 
         let mob = find_mob(mob_query).ok_or_else(|| {
             ClientError::Screenshot(format!(
-                "unknown mob {mob_query:?}; use '--mob list' to see all 36 available mobs"
+                "unknown mob {mob_query:?}; use '--mob list' to see all 35 available mobs"
             ))
         })?;
 
         let pos = Vec3::new(0.0, 64.0 + mob.world_y_offset, 0.0);
         let mut snapshot = make_snapshot(1, mob.kind, pos, mob.uuid);
-        snapshot.yaw = mob.yaw_deg;
-        snapshot.head_yaw = mob.yaw_deg;
+        face_the_camera(&mut snapshot, mob.yaw_deg);
 
-        let batches = mesh_entities(&[snapshot]);
+        let batches = mesh_entities(&[snapshot.clone()]);
         let total_vertices: usize = batches.values().map(|v| v.len()).sum();
 
         let report = EntityDemoReport {
@@ -1174,6 +1447,7 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
 
         let eye = Vec3::new(0.0, 64.0 + mob.camera_y, -mob.camera_dist);
         let mut camera = Camera::new(eye, std::f32::consts::PI, mob.camera_pitch);
+        camera.pin_render_origin(glam::DVec3::ZERO);
         camera.set_aspect(args.width, args.height);
 
         let verified_jar = crate::official::find_verified_jar().ok();
@@ -1184,7 +1458,6 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
             "CLEAN-ROOM PROCEDURAL TEXTURES"
         };
 
-        let mut overlay = Overlay::new(args.width, args.height);
         let lines = [
             format!(
                 "UMICRAFT M8 // ENTITY SHOWCASE // {}",
@@ -1193,9 +1466,12 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
             format!("1 ENTITY // {} VERTICES", total_vertices),
             texture_info.to_string(),
         ];
-        draw_caption(&mut overlay, &lines, args.width, args.height);
-
-        renderer.render(&camera, &overlay)?;
+        crate::caption::render_captioned(
+            &mut renderer,
+            &camera,
+            &lines,
+            (args.width, args.height),
+        )?;
         let image = renderer.read_pixels()?;
         write_png(path, &image.rgba, image.width, image.height)?;
 
@@ -1258,6 +1534,8 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
         _ => (Vec3::new(8.0, 65.2, 1.2), std::f32::consts::PI, -0.12),
     };
     let mut camera = Camera::new(eye, yaw, pitch);
+    // The scene is built in world coordinates: keep them as they are.
+    camera.pin_render_origin(glam::DVec3::ZERO);
     camera.set_aspect(args.width, args.height);
 
     // Look for verified official jar
@@ -1324,7 +1602,6 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
         "CLEAN-ROOM PROCEDURAL TEXTURES"
     };
 
-    let mut overlay = Overlay::new(args.width, args.height);
     let lines = [
         format!(
             "UMICRAFT M8 ENTITY DEMO // VIEW: {}",
@@ -1336,9 +1613,7 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
         ),
         format!("ALL 29 MINECRAFT 1.8 MOBS // {}", texture_info),
     ];
-    draw_caption(&mut overlay, &lines, args.width, args.height);
-
-    renderer.render(&camera, &overlay)?;
+    crate::caption::render_captioned(&mut renderer, &camera, &lines, (args.width, args.height))?;
     let image = renderer.read_pixels()?;
     write_png(path, &image.rgba, image.width, image.height)?;
 
@@ -1351,24 +1626,6 @@ pub fn run(args: &Args) -> Result<(), ClientError> {
     );
 
     Ok(())
-}
-
-fn draw_caption(overlay: &mut Overlay, lines: &[String], width: u32, height: u32) {
-    const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
-    const TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-
-    let layout = HudLayout::new(width, height);
-    let scale = layout.scale();
-    let text_width = lines
-        .iter()
-        .map(|line| Overlay::text_width(line, scale))
-        .fold(0.0_f32, f32::max);
-    let panel = layout.debug_panel_rect(text_width, lines.len());
-    overlay.rect(panel.x, panel.y, panel.width, panel.height, BACKGROUND);
-    for (index, line) in lines.iter().enumerate() {
-        let (x, y) = layout.debug_text_origin(index);
-        overlay.text(x, y, scale, TEXT, line);
-    }
 }
 
 #[cfg(test)]
@@ -1417,8 +1674,8 @@ mod tests {
     }
 
     #[test]
-    fn mob_catalog_contains_36_entities_without_duplicates() {
-        assert_eq!(MOB_CATALOG.len(), 36);
+    fn mob_catalog_contains_35_entities_without_duplicates() {
+        assert_eq!(MOB_CATALOG.len(), 35);
         let mut ids = std::collections::HashSet::new();
         for mob in MOB_CATALOG {
             assert!(ids.insert(mob.id), "duplicate mob id: {}", mob.id);
@@ -1446,7 +1703,6 @@ mod tests {
         assert_eq!(find_mob("snowgolem").unwrap().id, "snowman");
         assert_eq!(find_mob("alex").unwrap().id, "alex");
         assert_eq!(find_mob("steve").unwrap().id, "steve");
-        assert_eq!(find_mob("dirt").unwrap().id, "item");
         assert!(find_mob("unknown_nonexistent").is_none());
     }
 
@@ -1455,8 +1711,7 @@ mod tests {
         for mob in MOB_CATALOG {
             let pos = Vec3::new(0.0, 64.0 + mob.world_y_offset, 0.0);
             let mut snapshot = make_snapshot(1, mob.kind, pos, mob.uuid);
-            snapshot.yaw = mob.yaw_deg;
-            snapshot.head_yaw = mob.yaw_deg;
+            face_the_camera(&mut snapshot, mob.yaw_deg);
             let batches = mesh_entities(&[snapshot]);
             let total_vertices: usize = batches.values().map(|v| v.len()).sum();
             assert!(

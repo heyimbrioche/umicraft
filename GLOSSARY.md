@@ -34,7 +34,7 @@ game thread answers it with a position acknowledgement. ADR-0005 §A.5.
 
 **Medium** — what the player moves through in a tick and whose rules apply:
 land (with ladders), water or lava (`umicraft_game::media`). Cobwebs and
-soul sand are not media; they act on the motion after the move. ADR-0014.
+soul sand are not media; they act on the motion after the move. ADR-0017.
 
 ## Rendering
 
@@ -64,3 +64,7 @@ spec §2.
 (block states, light nibbles, biomes), with the section mask and the
 ground-up flag that describe them (`ChunkPayload`). The world parses it; the
 protocol only carries it. ADR-0011.
+
+**Built-in mod** — a client feature compiled into Umicraft that the player switches on and configures in the mods menu (FPS counter, coordinates, toggle sprint...). Not an external mod with an API (F3). See ADR-0065.
+
+**HUD widget** — the text box a built-in mod draws on the HUD, placed by an anchor, an offset and a scale, and moved with the mouse directly in the mods menu.

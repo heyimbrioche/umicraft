@@ -22,10 +22,11 @@
 //! allocations. Widgets are not retained: an ID is stable only as long as the
 //! ID stack and the widget label are stable.
 
-use crate::draw::DrawList;
+use crate::draw::{DrawList, SpriteSheet};
 use crate::geom::Rect;
 use crate::id::WidgetId;
 use crate::input::{InputEvent, Key, PointerButton, UiInput};
+use crate::menus::MenuArt;
 
 /// What one widget reports after it has been drawn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -87,6 +88,14 @@ pub struct Ui {
     primary_pressed: Option<[f32; 2]>,
     /// The press was claimed by a widget, so it no longer clears the focus.
     click_consumed: bool,
+    /// Buttons and sliders pressed since the last [`Ui::take_button_presses`].
+    button_presses: u32,
+    /// The optional widgets sprite sheet used for skinning buttons and sliders.
+    widgets_sheet: Option<SpriteSheet>,
+    /// The menu textures (dirt, title logo) of the user's client jar.
+    menu_art: MenuArt,
+    /// Text a widget asked to put on the clipboard (Control+C or Control+X).
+    clipboard: Option<String>,
 }
 
 impl Ui {
@@ -106,6 +115,10 @@ impl Ui {
             pointer: None,
             primary_pressed: None,
             click_consumed: false,
+            button_presses: 0,
+            widgets_sheet: None,
+            menu_art: MenuArt::default(),
+            clipboard: None,
         }
     }
 
@@ -159,7 +172,8 @@ impl Ui {
                 InputEvent::Wheel { .. }
                 | InputEvent::KeyPressed(_)
                 | InputEvent::KeyReleased(_)
-                | InputEvent::Text(_) => {}
+                | InputEvent::Text(_)
+                | InputEvent::Paste(_) => {}
             }
         }
         self.pending_traversal = pending;
@@ -237,6 +251,13 @@ impl Ui {
         &self.input
     }
 
+    /// The last known pointer position in physical pixels, if the pointer has
+    /// moved at all yet.
+    #[must_use]
+    pub fn pointer(&self) -> Option<[f32; 2]> {
+        self.pointer
+    }
+
     /// Mutable access to the draw list, for widgets that need a primitive
     /// instead of a helper.
     ///
@@ -245,6 +266,28 @@ impl Ui {
     /// intersects the viewport.
     pub fn draw(&mut self) -> &mut DrawList {
         &mut self.draw
+    }
+
+    /// Sets the widgets sprite sheet for textured UI widgets (buttons, sliders).
+    pub fn set_widgets_sheet(&mut self, sheet: Option<SpriteSheet>) {
+        self.widgets_sheet = sheet;
+    }
+
+    /// Sets the textures the menu screens draw as sprites.
+    pub fn set_menu_art(&mut self, art: MenuArt) {
+        self.menu_art = art;
+    }
+
+    /// The menu textures; empty fields select the original fallbacks.
+    #[must_use]
+    pub fn menu_art(&self) -> MenuArt {
+        self.menu_art
+    }
+
+    /// The active widgets sprite sheet, if any.
+    #[must_use]
+    pub fn widgets_sheet(&self) -> Option<SpriteSheet> {
+        self.widgets_sheet
     }
 
     /// Pushes a child scope onto the ID stack.
@@ -339,6 +382,30 @@ impl Ui {
         };
         self.responses.push(response);
         response
+    }
+
+    /// Records that an enabled button or slider was pressed.
+    ///
+    /// Vanilla plays `gui.button.press` at that moment (`GuiButton.playPressSound`
+    /// in `GuiScreen.mouseClicked`); the UI crate has no audio, so it only counts
+    /// and the window plays the sound.
+    pub fn note_button_press(&mut self) {
+        self.button_presses = self.button_presses.saturating_add(1);
+    }
+
+    /// Asks the window to put `text` on the system clipboard.
+    pub fn set_clipboard(&mut self, text: String) {
+        self.clipboard = Some(text);
+    }
+
+    /// The text a widget put on the clipboard since the last call, if any.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
+    }
+
+    /// The buttons and sliders pressed since the last call; resets the count.
+    pub fn take_button_presses(&mut self) -> u32 {
+        std::mem::take(&mut self.button_presses)
     }
 
     /// Marks the response stored for `id` in this frame as changed.

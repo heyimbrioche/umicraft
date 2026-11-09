@@ -80,8 +80,11 @@ impl BlockState {
             0 => BlockKind::Air,
             // Water and lava are full cubes that do not cull neighbours.
             8..=11 => BlockKind::Liquid,
+            // An extended piston base is 12/16 deep: its head stands in the
+            // rest of the block (bit 3 of the metadata is `extended`).
+            29 | 33 if self.metadata() & 8 != 0 => BlockKind::Flat,
             // See-through full cubes.
-            18 | 20 | 79 | 95 => BlockKind::Transparent,
+            18 | 20 | 79 | 95 | 161 => BlockKind::Transparent,
             // Non-cube blocks (slabs, stairs, fences, doors, rails, plants,
             // torches, etc.). Unknown blocks default to opaque cubes so a
             // missing registry entry never opens holes in the terrain.
@@ -94,8 +97,10 @@ impl BlockState {
             | 50
             | 51
             | 53
+            | 54
             | 55
             | 59
+            | 60
             | 63..=72
             | 75..=78
             | 81
@@ -109,10 +114,13 @@ impl BlockState {
             | 104..=109
             | 111
             | 113..=120
+            | 122
             | 126..=128
+            | 130
             | 131
             | 132
             | 134..=136
+            | 138
             | 139..=151
             | 154
             | 156
@@ -120,6 +128,7 @@ impl BlockState {
             | 160
             | 163
             | 164
+            | 166
             | 167
             | 171
             | 175..=178
@@ -169,6 +178,29 @@ mod tests {
         assert!(!BlockState::new(8, 0).is_opaque());
         assert!(!BlockState::new(31, 0).is_renderable());
         assert_eq!(BlockState::new(20, 0).kind(), BlockKind::Transparent);
+    }
+
+    /// A block smaller than a cube must never hide the face of its neighbour,
+    /// or the gap around it shows the void behind (chests are 14/16 wide,
+    /// farmland 15/16 high).
+    #[test]
+    fn partial_blocks_do_not_occlude() {
+        // Chest, farmland, dragon egg, ender chest, beacon, barrier.
+        for id in [54, 60, 122, 130, 138, 166] {
+            assert!(!BlockState::new(id, 0).is_opaque(), "block id {id}");
+        }
+        assert_eq!(BlockState::new(161, 0).kind(), BlockKind::Transparent);
+    }
+
+    /// A piston is a full cube at rest and a shorter base once extended, when
+    /// the head (34) and the gap around it must not hide the neighbours.
+    #[test]
+    fn an_extended_piston_does_not_occlude() {
+        for id in [29, 33] {
+            assert!(BlockState::new(id, 1).is_opaque(), "retracted {id}");
+            assert!(!BlockState::new(id, 9).is_opaque(), "extended {id}");
+        }
+        assert!(!BlockState::new(34, 9).is_opaque(), "head");
     }
 
     /// Slabs, stairs and other non-full blocks must be `Flat` so they never

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // Entity shader: textured articulated models, face shading, block/sky lighting,
-// alpha-tested cutout discard, and distance fog matching SkyState.
+// alpha-tested cutout discard, and the fog of `FogParams` (fog.wgsl is
+// prepended).
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -11,8 +12,15 @@ struct Camera {
     fog_start: f32,
     fog_end: f32,
     gamma: f32,
-    _pad0: f32,
+    // Exponential fog density; above zero it replaces the linear range.
+    fog_density: f32,
     _pad1: f32,
+    // Integer world offset of the render origin: positions are sent to the
+    // GPU relative to it (`view_proj` is built for that origin), so f32
+    // keeps its precision far from the world origin.
+    origin: vec3<f32>,
+    // The vanilla lightmap, `[sky * 16 + block]` (`lightmap.rs`).
+    lightmap: array<vec4<f32>, 256>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -27,22 +35,37 @@ struct VertexIn {
 };
 
 struct VertexOut {
-    @builtin(position) clip_position: vec4<f32>,
+    @invariant @builtin(position) clip_position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
     @location(1) uv: vec2<f32>,
-    @location(2) light: f32,
+    @location(2) light: vec3<f32>,
     @location(3) shade: f32,
+    @location(4) @interpolate(flat) hurt: f32,
+    @location(5) @interpolate(flat) flash: f32,
+    @location(6) @interpolate(flat) dye: vec3<f32>,
+    @location(7) @interpolate(flat) cutoff: f32,
 };
 
-fn light_brightness(level: f32) -> f32 {
-    return level / (3.0 * (1.0 - level) + 1.0);
-}
-
-fn gamma_correct(value: f32) -> f32 {
-    let inv = 1.0 - value;
-    let corrected = 1.0 - inv * inv * inv * inv;
-    return value * (1.0 - camera.gamma) + corrected * camera.gamma;
-}
+// Dye colours of the sheep wool and the wolf collar, by metadata value
+// (MCP `EntitySheep.DYE_TO_RGB`).
+var<private> DYES = array<vec3<f32>, 16>(
+    vec3<f32>(1.0, 1.0, 1.0),
+    vec3<f32>(0.85, 0.5, 0.2),
+    vec3<f32>(0.7, 0.3, 0.85),
+    vec3<f32>(0.4, 0.6, 0.85),
+    vec3<f32>(0.9, 0.9, 0.2),
+    vec3<f32>(0.5, 0.8, 0.1),
+    vec3<f32>(0.95, 0.5, 0.65),
+    vec3<f32>(0.3, 0.3, 0.3),
+    vec3<f32>(0.6, 0.6, 0.6),
+    vec3<f32>(0.3, 0.5, 0.6),
+    vec3<f32>(0.5, 0.25, 0.7),
+    vec3<f32>(0.2, 0.3, 0.7),
+    vec3<f32>(0.4, 0.3, 0.2),
+    vec3<f32>(0.4, 0.5, 0.2),
+    vec3<f32>(0.6, 0.2, 0.2),
+    vec3<f32>(0.1, 0.1, 0.1),
+);
 
 fn face_shade(normal: vec3<f32>) -> f32 {
     let ax = abs(normal.x);
@@ -55,36 +78,177 @@ fn face_shade(normal: vec3<f32>) -> f32 {
     return 0.6;
 }
 
-@vertex
-fn vs_main(in: VertexIn) -> VertexOut {
+// The vertex of a lit entity; the entry points differ in the shade they use.
+fn entity_vertex(in: VertexIn) -> VertexOut {
     var out: VertexOut;
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
-    out.world_position = in.position;
+    out.clip_position = camera.view_proj * vec4<f32>(in.position - camera.origin, 1.0);
+    out.world_position = in.position - camera.origin;
     out.uv = in.uv;
 
     // Unpack light nibbles: bits 0..=3 block, 4..=7 sky
-    let block_nibble = f32(in.light & 0x0Fu) / 15.0;
-    let sky_nibble = f32((in.light >> 4u) & 0x0Fu) / 15.0;
-
-    let block_light = light_brightness(block_nibble);
-    let sky_light = light_brightness(sky_nibble) * camera.sun_brightness;
-    out.light = gamma_correct(clamp(block_light + sky_light, 0.05, 1.0));
+    out.light = lightmap_sample(f32(in.light & 0x0Fu), f32((in.light >> 4u) & 0x0Fu));
     out.shade = face_shade(in.normal);
+    // Bit 8: hurt tint. Bits 9..=12: white flash level (the creeper fuse).
+    // Bit 13: dye tint, bits 14..=17 the dye.
+    out.hurt = f32((in.light >> 8u) & 1u);
+    out.flash = f32((in.light >> 9u) & 15u) / 15.0;
+    let dyed = (in.light >> 13u) & 1u;
+    out.dye = select(vec3<f32>(1.0), DYES[(in.light >> 14u) & 15u], dyed == 1u);
+    // Bits 27..=31: texels with an alpha under `n / 31` are dropped (the
+    // dragon dissolving, MCP `RenderDragon.renderModel` `alphaFunc`).
+    out.cutoff = f32(in.light >> 27u) / 31.0;
+    // Bit 18: experience orb, whose colour cycles with the phase of bits
+    // 19..=26, in 256 steps of a turn (MCP `RenderXPOrb`: red
+    // `(sin p + 1) / 2`, green 1, blue `(sin (p + 4.1887903) + 1) / 10`).
+    if (((in.light >> 18u) & 1u) == 1u) {
+        let phase = f32((in.light >> 19u) & 255u) * 0.02454369;
+        out.dye = vec3<f32>(
+            (sin(phase) + 1.0) * 0.5,
+            1.0,
+            (sin(phase + 4.1887903) + 1.0) * 0.1,
+        );
+    }
 
     return out;
+}
+
+@vertex
+fn vs_main(in: VertexIn) -> VertexOut {
+    return entity_vertex(in);
+}
+
+// The two fixed lights of `RenderHelper.enableGUIStandardItemLighting` in the
+// GUI's eye space: the vectors (0.2, 1, -0.7) and (-0.2, 1, 0.7), normalised
+// and turned by `rotate(-30, y)` then `rotate(165, x)`. Pinned by the test
+// `gui_light_constants_follow_the_reference` in entity_pass.rs.
+const GUI_LIGHT_0 = vec3<f32>(-0.23791005, -0.63443479, 0.73545313);
+const GUI_LIGHT_1 = vec3<f32>(0.02866725, -0.92737470, -0.37303398);
+
+// The brightness of a face in an item icon: ambient 0.4 plus the two lights at
+// 0.6 each (`GL_LIGHT_MODEL_AMBIENT`, `GL_DIFFUSE`), capped at 1. `normal` is
+// already in the GUI's eye space.
+fn gui_shade(normal: vec3<f32>) -> f32 {
+    let n = normalize(normal);
+    let lit = 0.4 + 0.6 * max(dot(n, GUI_LIGHT_0), 0.0) + 0.6 * max(dot(n, GUI_LIGHT_1), 0.0);
+    return min(lit, 1.0);
+}
+
+// An item icon: full light and the two fixed GUI lights instead of the face
+// shade of the world.
+@vertex
+fn vs_gui(in: VertexIn) -> VertexOut {
+    var out = entity_vertex(in);
+    out.light = vec3<f32>(1.0);
+    out.shade = gui_shade(in.normal);
+    return out;
+}
+
+// The share of the fog colour at a world position (`fog_amount` in fog.wgsl).
+fn fog_at(world_position: vec3<f32>) -> f32 {
+    let dist = distance(world_position, camera.camera_pos);
+    return fog_amount(dist, camera.fog_start, camera.fog_end, camera.fog_density);
+}
+
+// The colour of a lit texel: hurt tint, flash, light, shade and fog.
+fn lit_colour(in: VertexOut, tex: vec4<f32>) -> vec3<f32> {
+    // A hurt or dying entity is blended 30 % towards red before the light is
+    // applied (MCP `RendererLivingEntity.setBrightness`: (1, 0, 0, 0.3)).
+    var base = mix(tex.rgb * in.dye, vec3<f32>(1.0, 0.0, 0.0), 0.3 * in.hurt);
+    // The creeper about to explode flashes white, at most 20 %
+    // (MCP `RenderCreeper.getColorMultiplier`).
+    base = mix(base, vec3<f32>(1.0), 0.2 * in.flash);
+    let lit = base * in.light * in.shade;
+    return mix(lit, camera.fog_color, fog_at(in.world_position));
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(entity_texture, entity_sampler, in.uv);
-    if (tex.a < 0.1) {
+    if (tex.a < max(0.1, in.cutoff)) {
         discard;
     }
-
-    let lit = tex.rgb * in.light * in.shade;
-    let dist = distance(in.world_position, camera.camera_pos);
-    let fog = clamp((dist - camera.fog_start) / (camera.fog_end - camera.fog_start), 0.0, 1.0);
-    let final_rgb = mix(lit, camera.fog_color, fog);
-
-    return vec4<f32>(final_rgb, tex.a);
+    return vec4<f32>(lit_colour(in, tex), tex.a);
 }
+
+// An invisible entity seen by a spectator: its model is drawn at 15 % opacity
+// (MCP `RendererLivingEntity.renderModel`: colour alpha 0.15, alpha test above
+// 1/255).
+@fragment
+fn fs_ghost(in: VertexOut) -> @location(0) vec4<f32> {
+    let tex = textureSample(entity_texture, entity_sampler, in.uv);
+    if (tex.a < 0.003921569) {
+        discard;
+    }
+    return vec4<f32>(lit_colour(in, tex), tex.a * 0.15);
+}
+
+// Glowing layers (MCP `blendFunc(1, 1)`): the spider, enderman and dragon eyes,
+// the creeper charge, the wither aura and the enchantment glint. Their colour
+// is added to the frame, so there is no light, no shade and no alpha test.
+//
+// `light` is repurposed: bits 0..=7 are the red, 8..=15 the green and 16..=23
+// the blue of the tint, and bit 24 squares the colour
+// (`blendFunc(GL_SRC_COLOR, GL_ONE)` of the glint).
+struct AdditiveOut {
+    @invariant @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) @interpolate(flat) tint: vec3<f32>,
+    @location(3) @interpolate(flat) squared: f32,
+};
+
+@vertex
+fn vs_additive(in: VertexIn) -> AdditiveOut {
+    var out: AdditiveOut;
+    out.clip_position = camera.view_proj * vec4<f32>(in.position - camera.origin, 1.0);
+    out.world_position = in.position - camera.origin;
+    out.uv = in.uv;
+    out.tint = vec3<f32>(
+        f32(in.light & 0xFFu),
+        f32((in.light >> 8u) & 0xFFu),
+        f32((in.light >> 16u) & 0xFFu),
+    ) / 255.0;
+    out.squared = f32((in.light >> 24u) & 1u);
+    return out;
+}
+
+@fragment
+fn fs_additive(in: AdditiveOut) -> @location(0) vec4<f32> {
+    let tex = textureSample(entity_texture, entity_sampler, in.uv);
+    // The reference multiplies the colour as stored and adds it to the frame
+    // in the same space; the glint also squares it.
+    var rgb = tex.rgb * in.tint;
+    if (in.squared > 0.5) {
+        rgb = rgb * rgb;
+    }
+    // A glow fades into the fog like everything else.
+    return vec4<f32>(rgb * (1.0 - fog_at(in.world_position)), 1.0);
+}
+
+// The shadow under an entity (MCP `Render.renderShadow`): a texture of black
+// fading to nothing, whose opacity is computed per vertex by the client and
+// packed in the low byte of `light`.
+struct ShadowOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) @interpolate(flat) alpha: f32,
+};
+
+@vertex
+fn vs_shadow(in: VertexIn) -> ShadowOut {
+    var out: ShadowOut;
+    out.clip_position = camera.view_proj * vec4<f32>(in.position - camera.origin, 1.0);
+    out.world_position = in.position - camera.origin;
+    out.uv = in.uv;
+    out.alpha = f32(in.light & 0xFFu) / 255.0;
+    return out;
+}
+
+@fragment
+fn fs_shadow(in: ShadowOut) -> @location(0) vec4<f32> {
+    let tex = textureSample(entity_texture, entity_sampler, in.uv);
+    // A shadow fades into the fog like everything else.
+    return vec4<f32>(tex.rgb, tex.a * in.alpha * (1.0 - fog_at(in.world_position)));
+}
+

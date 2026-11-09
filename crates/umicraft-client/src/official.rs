@@ -9,11 +9,15 @@
 //! the repository or a release.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use umicraft_assets::client_jar::ClientJar;
+use umicraft_assets::client_pack;
 use umicraft_assets::install::OfficialInstall;
 use umicraft_assets::manifest::VersionJson;
-use umicraft_assets::AssetsError;
+use umicraft_assets::{AssetsError, DynamicImage, DYNAMIC_PREFIX};
+use umicraft_render::{HudSheets, SpriteSheet};
+use umicraft_ui::menus::{AchievementArt, BrandArt, MapTile, MenuArt};
 
 /// The only game version the client supports (protocol 47, spec §1.3).
 pub(crate) const VERSION_ID: &str = "1.8.8";
@@ -65,6 +69,129 @@ pub(crate) fn find_verified_jar() -> Result<ClientJar, AssetsError> {
     })
 }
 
+/// Loads the official `en_US.lang` contents from the Umicraft asset cache,
+/// or from the verified client jar.
+pub(crate) fn load_en_us_lang() -> Option<String> {
+    if let Ok(cache) = umicraft_assets::cache::AssetCache::in_data_dir() {
+        if let Some(text) = umicraft_assets::objects::AssetIndex::load_en_us_lang(&cache) {
+            return Some(text);
+        }
+    }
+
+    if let Ok(jar) = find_verified_jar() {
+        if let Ok(bytes) = jar.read_entry("assets/minecraft/lang/en_US.lang") {
+            if let Ok(text) = String::from_utf8(bytes) {
+                return Some(text);
+            }
+        }
+    }
+
+    None
+}
+
+/// Loads the GUI atlas from the verified client jar and adds the brand art.
+///
+/// Always `Some`: without a jar the atlas holds the brand art alone.
+pub(crate) fn load_gui_atlas() -> Option<umicraft_assets::GuiAtlas> {
+    let jar_atlas = find_verified_jar()
+        .ok()
+        .and_then(|jar| umicraft_assets::GuiAtlas::from_jar(&jar).ok());
+    Some(grow_atlas(jar_atlas.as_ref(), &[]))
+}
+
+/// The brand images of the client pack, decoded once.
+fn brand_images() -> &'static [DynamicImage] {
+    static IMAGES: OnceLock<Vec<DynamicImage>> = OnceLock::new();
+    IMAGES.get_or_init(|| {
+        client_pack::brand_images().unwrap_or_else(|error| {
+            tracing::warn!(%error, "client pack brand art unavailable");
+            Vec::new()
+        })
+    })
+}
+
+/// A copy of `atlas` (or of an empty atlas, when there is no client jar)
+/// holding the brand art and then `extra` runtime images.
+///
+/// `GuiAtlas::with_dynamic` drops earlier dynamic images, so everything that
+/// grows the atlas goes through here to keep the brand art in it.
+pub(crate) fn grow_atlas(
+    atlas: Option<&umicraft_assets::GuiAtlas>,
+    extra: &[DynamicImage],
+) -> umicraft_assets::GuiAtlas {
+    let images: Vec<DynamicImage> = brand_images().iter().chain(extra).cloned().collect();
+    atlas
+        .cloned()
+        .unwrap_or_else(umicraft_assets::GuiAtlas::empty)
+        .with_dynamic(&images)
+}
+
+/// The sprite sheet of an atlas region.
+///
+/// Its size is the coordinate space of the vanilla code (256 for `icons.png`),
+/// not the size of the PNG, so a resource pack of any resolution is read at
+/// the same sprites.
+pub(crate) fn sprite(region: &umicraft_assets::GuiRegion) -> SpriteSheet {
+    SpriteSheet {
+        u_min: region.u_min,
+        v_min: region.v_min,
+        u_max: region.u_max,
+        v_max: region.v_max,
+        width: region.space_width,
+        height: region.space_height,
+    }
+}
+
+/// Converts the GUI atlas into [`HudSheets`] for textured HUD rendering.
+pub(crate) fn hud_sheets(gui_atlas: Option<&umicraft_assets::GuiAtlas>) -> HudSheets {
+    let sheet = |name: &str| gui_atlas.and_then(|a| a.region(name)).map(sprite);
+    HudSheets {
+        widgets: sheet("widgets"),
+        icons: sheet("icons"),
+    }
+}
+
+/// The menu textures of the GUI atlas: the dirt of `options_background.png`,
+/// the title logo `title/minecraft.png` and the server list art (`icons.png`,
+/// `unknown_server.png`, `server_selection.png`) and the brand art of the
+/// client pack (`dynamic/umicraft/{logo,settings}`). A texture the atlas lacks
+/// stays `None`, which selects the flat and text fallbacks of the menus.
+pub(crate) fn menu_art(gui_atlas: Option<&umicraft_assets::GuiAtlas>) -> MenuArt {
+    let sheet = |name: &str| gui_atlas.and_then(|a| a.region(name)).map(sprite);
+    MenuArt {
+        dirt: sheet("options_background"),
+        logo: sheet("title/minecraft"),
+        stats_icons: sheet("container/stats_icons"),
+        achievements: achievement_art(&sheet),
+        icons: sheet("icons"),
+        unknown_server: sheet("misc/unknown_server"),
+        unknown_pack: sheet("misc/unknown_pack"),
+        default_pack: sheet("misc/default_pack"),
+        pack_arrows: sheet("resource_packs"),
+        server_selection: sheet("server_selection"),
+        brand: BrandArt {
+            logo: sheet(&brand_region("logo")),
+            settings: sheet(&brand_region("settings")),
+        },
+    }
+}
+
+/// The atlas region of the brand image `name` (`logo`, `settings`).
+fn brand_region(name: &str) -> String {
+    format!("{DYNAMIC_PREFIX}umicraft/{name}")
+}
+
+/// The achievement screen's textures: the background and all eight map
+/// tiles, or nothing when one is missing.
+fn achievement_art(sheet: &dyn Fn(&str) -> Option<SpriteSheet>) -> Option<AchievementArt> {
+    let background = sheet("achievement/achievement_background")?;
+    let mut tiles = [background; 8];
+    for (slot, name) in tiles.iter_mut().zip(MapTile::TEXTURES) {
+        *slot = sheet(&format!("blocks/{name}"))?;
+    }
+    Some(AchievementArt { background, tiles })
+}
+
 /// The client jar path of the installation, with a typed missing-file error.
 fn client_jar_path(
     install: &OfficialInstall,
@@ -79,4 +206,49 @@ fn client_jar_path(
                 .display()
                 .to_string(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use umicraft_assets::GuiRegion;
+
+    /// An `icons.png` region of an atlas of `side` px, alone in it.
+    fn icons(side: u32) -> GuiRegion {
+        GuiRegion {
+            u_min: 0.0,
+            v_min: 0.0,
+            u_max: 1.0,
+            v_max: 1.0,
+            pixel_width: side,
+            pixel_height: side,
+            space_width: 256,
+            space_height: 256,
+        }
+    }
+
+    /// The hearts of the HUD read the same part of `icons.png` in a 512 or a
+    /// 1024 px resource pack as in the 256 px one.
+    #[test]
+    fn the_hud_sprites_do_not_depend_on_the_resolution_of_the_pack() {
+        let reference = sprite(&icons(256)).sub(52, 0, 9, 9);
+        for side in [512, 1024] {
+            assert_eq!(sprite(&icons(side)).sub(52, 0, 9, 9), reference, "{side}px");
+        }
+        assert_eq!(reference[0], 52.0 / 256.0);
+        assert_eq!(reference[3], 9.0 / 256.0);
+    }
+
+    #[test]
+    fn a_sheet_without_a_vanilla_space_keeps_its_pixels() {
+        let region = GuiRegion {
+            pixel_width: 64,
+            pixel_height: 64,
+            space_width: 64,
+            space_height: 64,
+            ..icons(64)
+        };
+        let sheet = sprite(&region);
+        assert_eq!((sheet.width, sheet.height), (64, 64));
+    }
 }

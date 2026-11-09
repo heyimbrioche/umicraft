@@ -9,7 +9,7 @@
 
 use umicraft_mesh::{Mesh, Vertex, VertexLight};
 use umicraft_render::{
-    fallback_atlas, BlockAtlasError, Camera, FontAtlasError, Image, Overlay, Renderer,
+    fallback_atlas, BlockAtlasError, Camera, FontAtlasError, Image, NoIcons, Overlay, Renderer,
 };
 use umicraft_ui::{DrawList, Rect, TextStyle};
 use umicraft_world::ChunkPos;
@@ -112,7 +112,7 @@ fn ui_draw_list_renders_over_terrain_and_the_debug_overlay() {
     list.text([24.0, 34.0], "UI PASS", TextStyle::new(1.5, [1.0; 4]));
     list.pop_clip();
     renderer
-        .render_with_ui(&camera, &hud, &list)
+        .render_with_ui(&camera, &hud, &list, &mut NoIcons)
         .expect("render ui");
     let with_ui = renderer.read_pixels().expect("read ui");
     assert_ne!(
@@ -263,5 +263,81 @@ fn a_rejected_block_atlas_keeps_the_fallback_array_bound() {
     assert_eq!(
         after.rgba, fallback.rgba,
         "a rejected upload must leave the fallback frame untouched"
+    );
+}
+
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn brand_text_and_rounded_rects_render_through_their_own_pipelines() {
+    use umicraft_ui::brand_font::{rasterize, BRAND_PIXEL_SIZE};
+    use umicraft_ui::FontFace;
+
+    let ttf = include_bytes!("../../umicraft-assets/client-pack/umicraft/font/Inter-SemiBold.ttf");
+    let brand = rasterize(ttf, BRAND_PIXEL_SIZE).expect("brand font");
+    let mut renderer = Renderer::new_offscreen(WIDTH, HEIGHT).expect("offscreen renderer");
+    let mut camera = Camera::default();
+    camera.set_aspect(WIDTH, HEIGHT);
+    let hud = Overlay::new(WIDTH, HEIGHT);
+
+    let mut list = DrawList::new();
+    list.rounded_rect(Rect::new(8.0, 8.0, 100.0, 40.0), 12.0, [0.9, 0.2, 0.2, 1.0]);
+    let style = TextStyle::new(24.0 / BRAND_PIXEL_SIZE, [1.0; 4]).with_face(FontFace::Brand);
+    list.text([16.0, 14.0], "Umicraft", style);
+
+    // Without the brand font the text falls back to the game font.
+    renderer
+        .render_with_ui(&camera, &hud, &list, &mut NoIcons)
+        .expect("render without brand font");
+    let fallback = renderer.read_pixels().expect("read fallback");
+
+    renderer.set_brand_font(&brand).expect("upload brand font");
+    renderer
+        .render_with_ui(&camera, &hud, &list, &mut NoIcons)
+        .expect("render with brand font");
+    let smooth = renderer.read_pixels().expect("read brand");
+    assert_ne!(smooth.rgba, fallback.rgba, "the brand face must be drawn");
+
+    // The rounded corner leaves the background visible; the body is the fill.
+    let corner = pixel(&smooth, 8, 8);
+    assert!(corner[0] < 200 && corner[2] > 200, "corner {corner:?}");
+    let body = pixel(&smooth, 60, 46);
+    assert!(body[0] >= 225 && body[1] <= 55, "body {body:?}");
+}
+
+/// A pack's crosshair cell holds transparent white texels. The inverting blend
+/// ignores alpha, so without the alpha test of the reference (`alphaFunc(GREATER,
+/// 0.1)`) they invert the scene like the opaque cross does.
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn the_inverted_crosshair_skips_transparent_texels() {
+    let mut renderer = Renderer::new_offscreen(WIDTH, HEIGHT).expect("offscreen renderer");
+    let mut camera = Camera::default();
+    camera.set_aspect(WIDTH, HEIGHT);
+    let hud = Overlay::new(WIDTH, HEIGHT);
+    // Two texels: transparent white on the left, opaque white on the right.
+    renderer.set_gui_atlas(2, 1, &[255, 255, 255, 0, 255, 255, 255, 255]);
+
+    renderer
+        .render_with_ui(&camera, &hud, &DrawList::new(), &mut NoIcons)
+        .expect("render the scene");
+    let scene = renderer.read_pixels().expect("read the scene");
+
+    let mut list = DrawList::new();
+    list.image_inverted([0.0, 0.0, 0.5, 1.0], Rect::new(8.0, 8.0, 32.0, 32.0));
+    list.image_inverted([0.5, 0.0, 1.0, 1.0], Rect::new(60.0, 8.0, 32.0, 32.0));
+    renderer
+        .render_with_ui(&camera, &hud, &list, &mut NoIcons)
+        .expect("render the crosshair");
+    let drawn = renderer.read_pixels().expect("read the crosshair");
+
+    assert_eq!(
+        pixel(&drawn, 24, 24),
+        pixel(&scene, 24, 24),
+        "a transparent texel must leave the scene untouched"
+    );
+    let (before, after) = (pixel(&scene, 76, 24), pixel(&drawn, 76, 24));
+    assert!(
+        (0..3).all(|c| u16::from(before[c]) + u16::from(after[c]) >= 250),
+        "an opaque white texel inverts the scene: {before:?} -> {after:?}"
     );
 }

@@ -18,6 +18,75 @@ use crate::geom::Rect;
 /// Straight-alpha RGBA colour, components in `0.0..=1.0`.
 pub type Color = [f32; 4];
 
+/// A rectangular region of a GUI texture atlas that can be subdivided into
+/// sprite rects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpriteSheet {
+    /// Normalised UV of the top-left corner.
+    pub u_min: f32,
+    /// Normalised UV of the top-left corner.
+    pub v_min: f32,
+    /// Normalised UV of the bottom-right corner.
+    pub u_max: f32,
+    /// Normalised UV of the bottom-right corner.
+    pub v_max: f32,
+    /// Original pixel width of this texture.
+    pub width: u32,
+    /// Original pixel height of this texture.
+    pub height: u32,
+}
+
+impl SpriteSheet {
+    /// Creates a new sprite sheet definition.
+    #[must_use]
+    pub const fn new(
+        u_min: f32,
+        v_min: f32,
+        u_max: f32,
+        v_max: f32,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            u_min,
+            v_min,
+            u_max,
+            v_max,
+            width,
+            height,
+        }
+    }
+
+    /// Returns the normalised UV `[u_min, v_min, u_max, v_max]` for a
+    /// sub-rectangle defined in texture pixel coordinates.
+    #[must_use]
+    pub fn sub(&self, x: u32, y: u32, w: u32, h: u32) -> [f32; 4] {
+        let u_span = self.u_max - self.u_min;
+        let v_span = self.v_max - self.v_min;
+        let pw = self.width as f32;
+        let ph = self.height as f32;
+        [
+            self.u_min + x as f32 / pw * u_span,
+            self.v_min + y as f32 / ph * v_span,
+            self.u_min + (x + w) as f32 / pw * u_span,
+            self.v_min + (y + h) as f32 / ph * v_span,
+        ]
+    }
+}
+
+/// The typeface of a text run (ADR-0056).
+///
+/// Vanilla screens use [`FontFace::Game`]; Umicraft's own screens may use
+/// [`FontFace::Brand`], the sans-serif face rasterized from the client pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontFace {
+    /// The game bitmap font (the user's `ascii.png` or the built-in fallback).
+    #[default]
+    Game,
+    /// The Umicraft brand face (Inter SemiBold).
+    Brand,
+}
+
 /// The visual parameters of a text run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextStyle {
@@ -25,22 +94,45 @@ pub struct TextStyle {
     pub scale: f32,
     /// Straight-alpha RGBA colour.
     pub color: Color,
+    /// Clockwise turn in radians around the text origin (the top-left
+    /// corner of its first glyph); `0.0` draws upright text. Used by the
+    /// tilted splash of the title screen (`GuiMainMenu` rotates by -20
+    /// degrees).
+    pub rotation: f32,
+    /// The typeface; [`FontFace::Game`] by default.
+    pub face: FontFace,
 }
 
 impl TextStyle {
-    /// Creates a text style.
+    /// Creates an upright text style.
     #[must_use]
     pub const fn new(scale: f32, color: Color) -> Self {
-        Self { scale, color }
+        Self {
+            scale,
+            color,
+            rotation: 0.0,
+            face: FontFace::Game,
+        }
+    }
+
+    /// The same style turned by `radians` around the text origin.
+    #[must_use]
+    pub const fn rotated(mut self, radians: f32) -> Self {
+        self.rotation = radians;
+        self
+    }
+
+    /// The same style in typeface `face`.
+    #[must_use]
+    pub const fn with_face(mut self, face: FontFace) -> Self {
+        self.face = face;
+        self
     }
 }
 
 impl Default for TextStyle {
     fn default() -> Self {
-        Self {
-            scale: 1.0,
-            color: [1.0; 4],
-        }
+        Self::new(1.0, [1.0; 4])
     }
 }
 
@@ -54,6 +146,30 @@ pub enum DrawCommand {
         /// Straight-alpha RGBA colour.
         color: Color,
     },
+    /// Fill a rectangle with rounded corners (ADR-0056).
+    ///
+    /// The renderer tessellates the corners on the CPU and fades a
+    /// one-pixel fringe for anti-aliasing.
+    RoundedRect {
+        /// Rectangle to fill, in physical pixels.
+        rect: Rect,
+        /// Corner radius in physical pixels, clamped to half the shorter side.
+        radius: f32,
+        /// Straight-alpha RGBA colour.
+        color: Color,
+    },
+    /// Fill a rectangle with a vertical gradient from `top` to `bottom`.
+    ///
+    /// The renderer interpolates the colours per vertex, so the gradient has
+    /// no bands (`Gui.drawGradientRect` shades the same way).
+    VerticalGradient {
+        /// Rectangle to fill, in physical pixels.
+        rect: Rect,
+        /// Straight-alpha RGBA colour of the top edge.
+        top: Color,
+        /// Straight-alpha RGBA colour of the bottom edge.
+        bottom: Color,
+    },
     /// Draw one line of text at `position` (top-left of the first glyph).
     Text {
         /// Top-left position of the text run.
@@ -62,6 +178,41 @@ pub enum DrawCommand {
         text: String,
         /// Scale and colour of the run.
         style: TextStyle,
+    },
+    /// Draw a sub-region of the GUI texture atlas onto `dst`.
+    ///
+    /// `src` is `[u_min, v_min, u_max, v_max]` in normalised atlas
+    /// coordinates. The renderer samples the RGBA GUI atlas (not the font
+    /// atlas) and multiplies by `color` for tinting.
+    Image {
+        /// Source UV rectangle in the GUI atlas.
+        src: [f32; 4],
+        /// Destination rectangle in physical pixels.
+        dst: Rect,
+        /// Tint colour multiplied with the texel (white = unmodified).
+        color: Color,
+    },
+    /// Draw a sub-region of the GUI atlas with the inverting blend of the
+    /// crosshair (`glBlendFunc(ONE_MINUS_DST_COLOR, ONE_MINUS_SRC_COLOR)`), so
+    /// it stays visible on any background.
+    InvertedImage {
+        /// Source UV rectangle in the GUI atlas.
+        src: [f32; 4],
+        /// Destination rectangle in physical pixels.
+        dst: Rect,
+    },
+    /// Draw the item icon registered under `key` into `dst`.
+    ///
+    /// `key` is an opaque, client-chosen identifier that the renderer maps to
+    /// a slot of its icon atlas; the UI never interprets it. `glint` asks for
+    /// the enchantment glint overlay.
+    Item {
+        /// Opaque icon key chosen by the client.
+        key: u64,
+        /// Destination rectangle in physical pixels.
+        dst: Rect,
+        /// Whether to draw the enchantment glint over the icon.
+        glint: bool,
     },
     /// Clip every following command to `rect` until the matching
     /// [`DrawCommand::PopClip`].
@@ -79,6 +230,9 @@ pub struct DrawList {
     commands: Vec<DrawCommand>,
     /// Effective clip rectangles, each already intersected with its parent.
     clips: Vec<Rect>,
+    /// How see-through everything appended from now on is, `0.0` (the default)
+    /// being not at all; see [`Self::set_opacity`].
+    transparency: f32,
 }
 
 impl DrawList {
@@ -92,6 +246,31 @@ impl DrawList {
     pub fn clear(&mut self) {
         self.commands.clear();
         self.clips.clear();
+        self.transparency = 0.0;
+    }
+
+    /// Appends a copy of every command of `other`, which must be a complete frame
+    /// part: its clips balanced, its opacity already applied to its colours. A
+    /// cached part of a frame (the HUD) is laid into the frame with it.
+    pub fn extend_from(&mut self, other: &Self) {
+        self.commands.extend(other.commands.iter().cloned());
+    }
+
+    /// Multiplies the alpha of everything appended from now on by `opacity`
+    /// (`0.0..=1.0`), until the next call: a page fades in with it, a row at a
+    /// time. `1.0` draws as usual and a frame starts there.
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.transparency = 1.0 - opacity.clamp(0.0, 1.0);
+    }
+
+    /// `color` with the current opacity applied.
+    fn faded(&self, color: Color) -> Color {
+        [
+            color[0],
+            color[1],
+            color[2],
+            color[3] * (1.0 - self.transparency),
+        ]
     }
 
     /// True when the frame would draw nothing.
@@ -139,16 +318,57 @@ impl DrawList {
 
     /// Appends a solid rectangle.
     pub fn rect(&mut self, rect: Rect, color: Color) {
+        let color = self.faded(color);
         self.commands.push(DrawCommand::Rect { rect, color });
     }
 
+    /// Appends a rectangle with corners rounded by `radius` pixels.
+    pub fn rounded_rect(&mut self, rect: Rect, radius: f32, color: Color) {
+        let color = self.faded(color);
+        self.commands.push(DrawCommand::RoundedRect {
+            rect,
+            radius,
+            color,
+        });
+    }
+
+    /// Appends a rectangle shaded from `top` to `bottom`.
+    pub fn vertical_gradient(&mut self, rect: Rect, top: Color, bottom: Color) {
+        let (top, bottom) = (self.faded(top), self.faded(bottom));
+        self.commands
+            .push(DrawCommand::VerticalGradient { rect, top, bottom });
+    }
+
     /// Appends a text run.
-    pub fn text(&mut self, position: [f32; 2], text: impl Into<String>, style: TextStyle) {
+    pub fn text(&mut self, position: [f32; 2], text: impl Into<String>, mut style: TextStyle) {
+        style.color = self.faded(style.color);
         self.commands.push(DrawCommand::Text {
             position,
             text: text.into(),
             style,
         });
+    }
+
+    /// Appends a textured rectangle from the GUI atlas.
+    ///
+    /// `src` is `[u_min, v_min, u_max, v_max]` in normalised atlas
+    /// coordinates. `color` tints the texel (`[1.0; 4]` = unmodified).
+    pub fn image(&mut self, src: [f32; 4], dst: Rect, color: Color) {
+        let color = self.faded(color);
+        self.commands.push(DrawCommand::Image { src, dst, color });
+    }
+
+    /// Appends a textured rectangle drawn with the inverting blend of the
+    /// crosshair (MCP `GuiIngame.renderGameOverlay`, blend 775/769).
+    pub fn image_inverted(&mut self, src: [f32; 4], dst: Rect) {
+        self.commands.push(DrawCommand::InvertedImage { src, dst });
+    }
+
+    /// Appends an item icon registered under `key`, drawn into `dst`.
+    ///
+    /// `glint` adds the enchantment glint. The key is opaque to the UI.
+    pub fn item(&mut self, key: u64, dst: Rect, glint: bool) {
+        self.commands.push(DrawCommand::Item { key, dst, glint });
     }
 
     /// Starts a clip scope.
@@ -207,6 +427,36 @@ mod tests {
         assert_eq!(list.len(), 4);
         assert!(matches!(list.commands()[0], DrawCommand::PushClip { .. }));
         assert!(matches!(list.commands()[3], DrawCommand::PopClip));
+    }
+
+    #[test]
+    fn vertical_gradient_appends_its_command() {
+        let mut list = DrawList::new();
+        let rect = Rect::new(0.0, 0.0, 4.0, 8.0);
+        list.vertical_gradient(rect, [1.0; 4], [0.0; 4]);
+        assert_eq!(
+            list.commands(),
+            [DrawCommand::VerticalGradient {
+                rect,
+                top: [1.0; 4],
+                bottom: [0.0; 4]
+            }]
+        );
+    }
+
+    #[test]
+    fn item_appends_an_item_command() {
+        let mut list = DrawList::new();
+        let dst = Rect::new(1.0, 2.0, 16.0, 16.0);
+        list.item(7, dst, true);
+        assert_eq!(
+            list.commands(),
+            [DrawCommand::Item {
+                key: 7,
+                dst,
+                glint: true
+            }]
+        );
     }
 
     #[test]

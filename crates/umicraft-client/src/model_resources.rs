@@ -26,6 +26,7 @@ use umicraft_mesh::tint::BiomeTints;
 use umicraft_mesh::ModelMeshContext;
 use umicraft_model::{definitions, BlockModelSet, ModelError, ResourceSource};
 
+use crate::item_icons::ItemResources;
 use crate::official;
 
 /// Virtual prefix of the block textures inside the client jar.
@@ -97,6 +98,7 @@ pub struct ModelResources {
     resources: ClientResources,
     models: Arc<BlockModelSet>,
     context: Arc<ModelMeshContext>,
+    items: Arc<ItemResources>,
 }
 
 impl ModelResources {
@@ -129,8 +131,15 @@ impl ModelResources {
     pub fn load_with_pack_paths(paths: &[std::path::PathBuf]) -> Result<Self, ModelResourcesError> {
         let mut packs = Vec::with_capacity(paths.len());
         for path in paths {
-            let pack = umicraft_assets::ResourcePack::from_path(path)?;
-            packs.push(pack);
+            // A pack that cannot be read (deleted, unreadable folder, broken
+            // zip) is skipped: one bad pack must not turn every texture into
+            // the procedural fallback.
+            match umicraft_assets::ResourcePack::from_path(path) {
+                Ok(pack) => packs.push(pack),
+                Err(error) => {
+                    tracing::warn!(pack = %path.display(), %error, "skipping a resource pack that could not be loaded");
+                }
+            }
         }
         Self::load_with_packs(&packs)
     }
@@ -168,10 +177,12 @@ impl ModelResources {
             packs = packs.len(),
             "loaded 1.8 block models, atlas and resource packs"
         );
+        let items = Arc::new(ItemResources::load(&resources)?);
         Ok(Self {
             resources,
             models,
             context,
+            items,
         })
     }
 
@@ -187,34 +198,8 @@ impl ModelResources {
     ) -> Result<Self, ModelResourcesError> {
         let jar = official::open_client_jar(install)?;
         let resources = ClientResources::load(&jar)?;
-        let models = Arc::new(BlockModelSet::build(&resources, definitions())?);
-        // Sample the two 256×256 colormaps once per base biome into the small
-        // immutable table the mesher shares with every worker (ADR-0009). The
-        // closures only borrow `resources` for this call.
-        let tints = resources.colormaps().map(|maps| {
-            Arc::new(BiomeTints::from_samplers(
-                |temperature, rainfall| maps.grass.sample(temperature, rainfall),
-                |temperature, rainfall| maps.foliage.sample(temperature, rainfall),
-            ))
-        });
-        let context = Arc::new(ModelMeshContext {
-            models: Arc::clone(&models),
-            atlas: Arc::new(resources.atlas().layout().clone()),
-            tints,
-        });
-        tracing::info!(
-            root = %install.root().display(),
-            blockstates = models.blockstate_count(),
-            source_models = models.source_model_count(),
-            layers = resources.atlas().layers(),
-            biome_tints = context.tints.is_some(),
-            "loaded the 1.8 block models and texture atlas"
-        );
-        Ok(Self {
-            resources,
-            models,
-            context,
-        })
+        tracing::info!(root = %install.root().display(), "reading the 1.8 client jar");
+        Self::from_resources_and_packs(resources, &[])
     }
 
     /// The verified in-memory resources and their atlas.
@@ -233,6 +218,12 @@ impl ModelResources {
     #[must_use]
     pub fn models(&self) -> &BlockModelSet {
         &self.models
+    }
+
+    /// The baked item models, shared with the icon provider.
+    #[must_use]
+    pub fn items(&self) -> Arc<ItemResources> {
+        Arc::clone(&self.items)
     }
 
     /// A clone of the immutable context shared with the mesh workers.
