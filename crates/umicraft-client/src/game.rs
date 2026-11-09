@@ -1598,6 +1598,8 @@ fn follow_body(game: &mut Game) {
         game.pitch.to_degrees(),
         EntityFlags::new(sneaking, 0x7F),
     );
+    // The body sits (bent legs) while the player rides, as a remote rider does.
+    game.body.vehicle = game.vehicle.map(EntityId);
     // The swing of the third person arm advances with the tick, as the
     // animation of every tracked entity does in `EntityStore::tick`.
     game.body.animation.tick();
@@ -1955,15 +1957,7 @@ fn apply_net_event(
         }
         PlayEvent::EntityTeleport(packet) => {
             if packet.entity_id == game.entity_id {
-                let correction = ServerCorrection::new(
-                    f64::from(packet.x) / 32.0,
-                    f64::from(packet.y) / 32.0,
-                    f64::from(packet.z) / 32.0,
-                    f32::from(packet.yaw) * 360.0 / 256.0,
-                    f32::from(packet.pitch) * 360.0 / 256.0,
-                    packet.on_ground,
-                );
-                apply_correction(game, &correction, queue);
+                teleport_local_player(game, &packet);
             } else {
                 let pos = DVec3::new(
                     f64::from(packet.x) / 32.0,
@@ -2783,23 +2777,39 @@ fn apply_placement(
     game.server_view.forget_position();
 }
 
-/// Applies an authoritative correction from the server.
-fn apply_correction(game: &mut Game, correction: &ServerCorrection, queue: &mut CommandQueue) {
-    if let Some(state) = game.state.as_mut() {
-        if let Some(world) = game.world.as_ref() {
-            state.apply_correction(correction, world);
-        }
-        game.yaw = state.player().yaw;
-        game.pitch = state.player().pitch;
-    }
-    queue.push(ClientCommand::AckPosition {
-        x: correction.x,
-        y: correction.y,
-        z: correction.z,
-        yaw: correction.yaw.to_degrees(),
-        pitch: correction.pitch.to_degrees(),
-        on_ground: correction.on_ground,
-    });
+/// MCP `NetHandlerPlayClient.handleEntityTeleport` for the local player: the entity
+/// is moved with `setPositionAndRotation2` and nothing is sent back. The old code
+/// answered with a `Player Position and Look` whose yaw was degrees turned into
+/// degrees again (6929 for 121), and left the view where it was: a server that
+/// teleports the player to check its client saw both.
+///
+/// The motion is kept, and a position within 1/32 of a block of the current one
+/// stays where it is (only the rotation changes), as in the reference.
+fn teleport_local_player(
+    game: &mut Game,
+    packet: &umicraft_protocol::packets::play::clientbound::EntityTeleport,
+) {
+    let Some(state) = game.state.as_mut() else {
+        return;
+    };
+    let target = DVec3::new(
+        f64::from(packet.x) / 32.0,
+        f64::from(packet.y) / 32.0,
+        f64::from(packet.z) / 32.0,
+    );
+    let here = state.position();
+    let near = (here - target).abs().max_element() < 0.031_25;
+    let correction = ServerCorrection::new(
+        if near { here.x } else { target.x },
+        if near { here.y } else { target.y },
+        if near { here.z } else { target.z },
+        (f32::from(packet.yaw) * 360.0 / 256.0).to_radians(),
+        (f32::from(packet.pitch) * 360.0 / 256.0).to_radians(),
+        packet.on_ground,
+    );
+    state.teleport(&correction, [true; 3]);
+    game.yaw = state.player().yaw;
+    game.pitch = state.player().pitch;
     game.server_view.forget_position();
 }
 
@@ -3238,6 +3248,14 @@ fn tick(
     // The simulation only runs on a loaded world.
     let ready = game.world_ready();
     if ready {
+        // MCP `Entity.updateRidden`: a vehicle that is gone (destroyed by the
+        // server, or fallen out of the world) lets its rider go, where it is.
+        if game
+            .vehicle
+            .is_some_and(|vehicle| game.entities.rider_feet(EntityId(vehicle)).is_none())
+        {
+            game.vehicle = None;
+        }
         let seat = game
             .vehicle
             .and_then(|vehicle| game.entities.rider_feet(EntityId(vehicle)));
@@ -3905,6 +3923,117 @@ mod tests {
         assert_eq!(
             game.body.frame_data().held.map(|held| held.item_id),
             Some(276)
+        );
+    }
+
+    #[test]
+    fn the_body_of_a_rider_sits() {
+        let mut game = game_on_floor_with(BlockState::AIR);
+        game.entity_id = 7;
+        follow_body(&mut game);
+        assert!(!game.body.frame_data().riding, "on foot");
+        game.vehicle = Some(42);
+        follow_body(&mut game);
+        assert!(game.body.frame_data().riding, "on a mount");
+        game.vehicle = None;
+        follow_body(&mut game);
+        assert!(!game.body.frame_data().riding, "back on foot");
+    }
+
+    #[test]
+    fn an_attach_packet_off_the_wire_mounts_the_local_player() {
+        // `S1BPacketEntityAttach`: entity 7, vehicle 42, leash 0.
+        let bytes = [0, 0, 0, 7, 0, 0, 0, 42, 0];
+        let packet = umicraft_protocol::packets::play::clientbound::AttachEntity::decode(
+            &mut bytes.as_slice(),
+        )
+        .expect("decodes");
+        let mut game = placed_game();
+        game.entity_id = 7;
+        let mut queue = CommandQueue::default();
+        let (frames, _rx) = mpsc::sync_channel(8);
+        handle_net(
+            &mut game,
+            PlayEvent::AttachEntity(packet),
+            &mut queue,
+            &frames,
+        );
+        assert_eq!(game.vehicle, Some(42));
+    }
+
+    #[test]
+    fn an_entity_teleport_of_the_local_player_turns_the_view_and_sends_nothing() {
+        let mut game = placed_game();
+        game.entity_id = -100;
+        let mut queue = CommandQueue::default();
+        let (frames, _rx) = mpsc::sync_channel(8);
+        // Entity -100 to (3, 3, 3) looking 0x56 * 360 / 256 = 120.9 degrees.
+        handle_net(
+            &mut game,
+            PlayEvent::EntityTeleport(
+                umicraft_protocol::packets::play::clientbound::EntityTeleport {
+                    entity_id: -100,
+                    x: 96,
+                    y: 96,
+                    z: 96,
+                    yaw: 0x56,
+                    pitch: 0,
+                    on_ground: false,
+                },
+            ),
+            &mut queue,
+            &frames,
+        );
+        let state = game.state.as_ref().expect("state");
+        assert_eq!(state.position(), DVec3::new(3.0, 3.0, 3.0));
+        assert!(
+            (game.yaw.to_degrees() - 120.9375).abs() < 1e-3,
+            "{}",
+            game.yaw.to_degrees()
+        );
+        assert!(
+            queue.ordered.is_empty(),
+            "vanilla answers nothing: {:?}",
+            queue.ordered
+        );
+        assert!(queue.position.is_none());
+    }
+
+    #[test]
+    fn a_vehicle_that_falls_out_of_the_world_lets_the_local_player_go() {
+        let mut game = placed_game();
+        game.entity_id = 7;
+        // A dropped item (object type 2) just above the void line.
+        game.entities.spawn_object(
+            EntityId(42),
+            2,
+            DVec3::new(8.0, -63.0, 8.0),
+            0.0,
+            0.0,
+            glam::Vec3::ZERO,
+            0,
+        );
+        game.vehicle = Some(42);
+        load_surrounding_columns(&mut game);
+        let mut queue = CommandQueue::default();
+        let (frames, _rx) = mpsc::sync_channel(8);
+        let (chunks, _chunk_rx) = mpsc::sync_channel(8);
+        tick(&mut game, &mut queue, &frames, &chunks, Instant::now());
+        assert_eq!(game.vehicle, Some(42), "still above the line");
+        assert_eq!(
+            game.status_data.position_reports, 0,
+            "a rider reports no position"
+        );
+        // The server sinks the item below y = -64, as the launcher check does.
+        game.entities
+            .move_relative(EntityId(42), DVec3::new(0.0, -3.5, 0.0), false);
+        for _ in 0..8 {
+            tick(&mut game, &mut queue, &frames, &chunks, Instant::now());
+        }
+        assert_eq!(game.vehicle, None, "the item died in the void");
+        assert!(
+            game.status_data.position_reports > 0,
+            "on foot again, the position is reported"
         );
     }
 

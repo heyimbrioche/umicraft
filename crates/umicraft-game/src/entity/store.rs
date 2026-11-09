@@ -34,6 +34,10 @@ const LIVING_HEALTH: u8 = 6;
 /// (MCP `EntityLivingBase.handleStatusUpdate`, `limbSwingAmount = 1.5`).
 const HURT_LIMB_AMOUNT: f32 = 1.5;
 
+/// The height below which an entity is out of the world (MCP
+/// `Entity.onEntityUpdate`, `posY < -64.0D`).
+const VOID_Y: f64 = -64.0;
+
 /// The storage and simulation of non-local entities on the game thread.
 #[derive(Debug, Clone, Default)]
 pub struct EntityStore {
@@ -573,6 +577,20 @@ impl EntityStore {
     /// Advances the simulation by one tick (20 Hz): glide to the server
     /// position, then animate limbs and body (MCP `EntityLivingBase.onUpdate`).
     pub fn tick(&mut self) {
+        // MCP `Entity.onEntityUpdate`: below y = -64 an entity kills itself. On the
+        // client that removes an object (`Entity.kill` is `setDead`); a living one
+        // only asks for damage, which the client does not deal. A server that
+        // checks the client counts on it: it sinks the item the player sits on and
+        // waits for the player, let go below the world, to report its position.
+        let fallen: Vec<i32> = self
+            .entities
+            .values()
+            .filter(|entity| !entity.kind.is_living() && entity.position.y < VOID_Y)
+            .map(|entity| entity.id.0)
+            .collect();
+        if !fallen.is_empty() {
+            self.destroy(&fallen);
+        }
         for entity in self.entities.values_mut() {
             entity.begin_tick();
             entity.glide_to_target();
