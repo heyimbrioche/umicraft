@@ -13,10 +13,12 @@ Rules (restated):
 
 | Thread | Owns | Talks to |
 |---|---|---|
-| Main/render thread (winit in windowed play) | Window, wgpu submission, the camera, the overlay, the UI frame and input translation, the sky/fog environment, the transparent draw order, the `WorldView` (camera interpolation, chunk queue, mesh pool), and the one-time official resource load | Game thread via bounded frame and chunk channels; mesh pool via bounded job/result channels |
-| **Game thread** | `umicraft_world::World`, `umicraft_game::GameState`, the 20 Hz tick, the HUD state | Network thread and render thread via bounded channels (events in, frames and chunk snapshots out) |
-| Network thread (`umicraft-net`) | Tokio current-thread runtime, `Connection`, `PlaySession` and the `drive` loop (ADR-0010), the keepalive answers | Game thread via a bounded inbox of events; game thread via a bounded queue of serverbound commands |
-| Mesh workers (1–4) | CPU meshing of immutable `ChunkSnapshot`s, with a shared immutable `ModelMeshContext` (models, atlas layout and the optional `BiomeTints` table) when the official resources loaded | Job receiver mutex (receive only) + bounded `sync_channel(512)` results |
+| Main/render thread (winit in windowed play) | Window, wgpu submission, the camera, the overlay, the UI frame and input translation, the sky/fog environment, the transparent draw order, the `WorldView` (camera interpolation, chunk queue, mesh pool, revision-tracked HUD double-buffer), and the one-time official resource load | Game thread via bounded frame and chunk channels + lock-free `AtomicLookSlot`; mesh pool via lock-free bounded MPMC job/result channels |
+| **Game thread** | `umicraft_world::World`, `umicraft_game::GameState`, the 20 Hz tick, the HUD state | Network thread and render thread via bounded channels (events in, frames and chunk snapshots out) and lock-free `AtomicLookSlot` |
+| Network thread (`umicraft-net`) | Tokio current-thread runtime, `Connection`, `PlaySession` and the `drive` loop (ADR-0010), the keepalive answers, 64B-aligned `SessionCounters` | Game thread via a bounded inbox of events; game thread via a bounded queue of serverbound commands |
+| Mesh workers (`1..=8`, `umicraft-mesh-N`) | CPU meshing of immutable `ChunkSnapshot`s, with a shared immutable `ModelMeshContext` (models, atlas layout and the optional `BiomeTints` table) when the official resources loaded | Lock-free `crossbeam_channel::bounded(512)` MPMC job and result queues + `CachePadded` atomic telemetry counters |
+| Audio threads (`umicraft-audio`, `umicraft-audio-decode`, cpal device) | Sound index, PCM cache, 20 Hz sound tick, Ogg Vorbis background music stream decoder, and lock-free realtime cpal mixer | Game and render threads via bounded `sync_channel(256)` (`try_send` drop-on-full) |
+| Background I/O workers (`texture-fetch`, `umicraft-ping`, `umicraft-pack`, `umicraft-screenshot`) | Concurrent HTTP skin/cape downloads (`JoinSet` cap 6), server list pings (`JoinSet` cap 5), verified server resource pack downloads, and offloaded PNG screenshot encoding | Render and game threads via bounded channels |
 
 The game thread is the only owner of the world: the render thread never
 mutates a chunk, and the collision solver never takes a lock (spec §5.3,
@@ -101,13 +103,32 @@ ADR-0005).
 
 ### Input boundary
 
-- The render thread (or the headless script) turns the keyboard and the
-  mouse into an `InputUpdate` and sends it into the bounded inbox of the
-  game thread with `try_send`. A full inbox means the game thread is
-  behind; the input is repeated on the next frame, and the look deltas are
-  accumulated until they are accepted, so no mouse movement is lost.
-- The game thread owns the view angles: the look deltas are applied to its
-  yaw and pitch, and the server corrections overwrite them.
+- The render thread (or the headless script) sends `InputUpdate` messages over
+  a dedicated lock-free `crossbeam_channel::bounded(512)` queue (`Session::inputs`)
+  completely decoupled from network events. This eliminates head-of-line blocking:
+  heavy packet floods (chunk streaming, entity bursts in PvP) never delay or drop
+  player inputs.
+- The game thread drains `inputs` with priority before network events. When waiting
+  between ticks, it uses `crossbeam_channel::select!` with an input receiver branch,
+  waking up in sub-microsecond time as soon as a key or mouse click arrives rather
+  than sleeping until the next 50 ms tick.
+- Physical mouse clicks and keyboard state changes call `publish_input()` immediately,
+  transmitting actions in sub-millisecond time rather than buffering them until the
+  next redraw.
+- The render thread applies raw mouse movement deltas directly to the active camera
+  via `WorldView::apply_look_delta` on the current frame. This eliminates the 1-frame
+  roundtrip latency formerly required for the game thread to echo angles back through
+  `AtomicLookSlot`, achieving true 0-frame mouse look latency for competitive PvP.
+- The game thread owns the authoritative view angles and simulation: the look deltas
+  are applied to its yaw and pitch, and server corrections overwrite them. Between two
+  20 Hz ticks, mouse look updates are published into a 64-byte aligned, lock-free
+  single-producer/single-consumer seqlock (`AtomicLookSlot`) and consumed by
+  `WorldView::sync` without taking any `Mutex`. When no mouse movement happened
+  since the previous frame, the render thread checks the sequence counter with
+  read-only atomic loads without dirtying the cache line.
+- Full input latency metrics (`InputLatencyMetrics`: input processing time, queue latency,
+  input-to-frame latency, swapchain presentation timing) are tracked in microseconds
+  and surfaced live on the F3 overlay.
 
 ### UI boundary (M4)
 
@@ -179,23 +200,82 @@ ADR-0005).
   before it leaves the game thread. Snapshot capture is the only game
   thread work; the 16×256×16 meshing scan, model-quad emission and texture
   layer assignment stay on workers.
-- Jobs use `sync_channel(512)` and are submitted with `try_send`. If the
-  queue is full, the chunk is put back on the render thread's waiting list
-  and retried on a later frame; the render thread never waits for a worker.
-- Results use `sync_channel(512)`. Workers may block briefly if the render
-  thread is behind, but the render thread only polls (`try_recv`). On pool
-  drop the job sender and result receiver are closed before joining, so a
-  worker blocked on a full result queue exits instead of deadlocking.
-- Workers share the job `Receiver` behind a `Mutex`, held only while
-  `recv()` waits for the next job. The meshing inner loop and the terrain
-  data are lock-free.
+- Jobs and results use lock-free MPMC bounded queues (`crossbeam_channel::bounded(512)`).
+  Jobs are submitted with `try_send`. If the queue is full, the chunk is put
+  back on the render thread's waiting list and retried on a later frame; the
+  render thread never waits for a worker.
+- Workers receive jobs directly from their cloned lock-free MPMC `Receiver`
+  without any `Mutex` contention. All per-pool telemetry counters (`PoolCounters`)
+  are wrapped in `umicraft_core::CachePadded` (`#[repr(align(64))]`) to prevent
+  false sharing across CPU cores.
 - Every job carries the `WorldView`'s world generation, which a `Reset`
   increments. A result of an older generation is discarded, so a mesh of a
   replaced world that was still being built is never drawn in the new one.
 
+### Audio boundary (P11-A)
+
+- `umicraft-audio::thread::spawn` starts one std thread named `umicraft-audio`.
+  It owns the `Engine` (sound index, PCM cache, source limits, delayed sounds,
+  category volumes, the listener) and the backend. The backend is built on that
+  thread because audio streams are often not `Send`.
+- The game and render threads hold only an `AudioHandle`: a cloneable
+  `SyncSender` of `AudioMessage`s over `sync_channel(256)`. Every call is a
+  `try_send`; a full or closed queue **drops the message and counts it**
+  (`AudioHandle::dropped`), so a stuck audio device can never stall the
+  simulation or a frame. The listener and volume messages are repeated by the
+  caller, so a dropped one is superseded.
+- The audio thread drains the queue with `recv_timeout` and runs a 20 Hz tick
+  (`SoundManager.updateAllSounds`): it frees finished sources and starts the
+  sounds whose delay is over. A missed tick is skipped, not replayed.
+- The device callback runs on a third, realtime thread owned by cpal. The audio
+  thread hands it voices through a bounded `sync_channel(64)` (`try_send`) and
+  reads how many ended from two atomics; the callback never takes a lock and
+  does not allocate (the voice list is reserved up front, a voice that does not
+  fit is dropped). The PCM is `Arc`-shared, so no sample data is copied between
+  threads.
+- File reads and Ogg decoding of effects happen only on the audio thread, on a
+  cache miss. Streamed entries (music) are decoded on a fourth thread,
+  `umicraft-audio-decode`, started on the first track (ADR-0052): the audio thread
+  reads the bytes, sends them over a channel and polls the result with
+  `try_recv` on its tick, so a 3-minute track never delays an effect.
+- Music state crosses threads as atomics only: `MusicActivity` (two counters,
+  `AudioHandle::music_playing`) tells the render thread whether its track is in
+  flight; `AudioMessage::StopMusic` is another `try_send`. The render thread
+  runs `MusicTicker` at 20 Hz (`audio_bridge::music`).
+- Measured (`tests/stall_latency.rs`): with a loader and a backend that sleep
+  40 ms per operation, the game thread (20 Hz) and the render thread (60 fps)
+  see p99 about 9 us and max about 27 us per call (release); the queue overflows
+  and drops instead of waiting. Numbers in `docs/perf-log.md`.
+- The crate depends on neither `umicraft-game` nor `umicraft-net`: callers
+  translate their events into `SoundRequest`s.
+
+### Audio bridge in the client (P11-E)
+
+- **Cues cross the thread boundary as their own event.** Once per tick the
+  game thread calls `GameState::drain_sound_cues()` (`publish_sounds`) and, when
+  the list is not empty, `try_send`s `RenderEvent::Sounds(Vec<SoundCue>)` on the
+  frame queue. It is not part of `Frame`, because a full frame queue skips
+  frames and a footstep should not vanish with one. If the event does not fit
+  either, the cues are dropped; the game thread never waits.
+- The render thread's `WorldView` collects the cues (`take_sounds`); the window
+  takes them once per frame, turns each into a `SoundRequest`
+  (`audio_bridge::cues`) and calls `AudioHandle::play` (a `try_send`). The
+  listener is rebuilt from the interpolated camera every frame
+  (`audio_bridge::listener`), so the pan follows the mouse look.
+- The window owns the `AudioBridge` (and with it the `AudioThread`). It is
+  created at start-up: the asset index, `sounds.json` (about 38 KB) and the
+  options are read there, once, before the first frame; no `.ogg` is read on
+  the render thread (the audio thread loads and decodes on a cache miss).
+- Menu clicks: `Ui` counts the presses of enabled buttons and of sliders
+  (`take_button_presses`); the window plays `gui.button.press` after the UI
+  frame. Volumes: `VolumeSync` sends the sliders that changed once per frame
+  (a dropped message is retried on the next frame).
+- Without a bridge (`--no-audio`, no downloaded assets, headless, tests) there
+  is no audio thread and every call returns at once.
+
 ### Current deviations from the target model
 
-- Lighting workers, asset/IO pool, audio thread, and mod workers do not exist
+- Lighting workers, asset/IO pool and mod workers do not exist
   yet. Add each to this table when introduced.
 - The player inventory is not received in M3: the 1.8 protocol only sends it
   with the window packets, which belong to M9. The client therefore knows

@@ -9,7 +9,22 @@ publish = false
 
 [dependencies]
 glam = "0.34"
+serde_json.workspace = true
+thiserror.workspace = true
+umicraft-core.workspace = true
+umicraft-protocol.workspace = true
 umicraft-world.workspace = true
+
+[features]
+# Forwards to `umicraft-core/profiling`: puffin CPU spans.
+profiling = ["umicraft-core/profiling"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "particles"
+harness = false

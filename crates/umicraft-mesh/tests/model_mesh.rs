@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use umicraft_mesh::tint::{BiomeTints, WHITE};
 use umicraft_mesh::{
-    mesh_chunk, mesh_chunk_with_models, BlockSource, ChunkSnapshot, Mesh, ModelMeshContext, Vertex,
-    VertexLight,
+    mesh_chunk, mesh_chunk_with_models, mesh_chunk_with_settings, BlockSource, ChunkSnapshot,
+    Lighting, Mesh, MeshSettings, ModelMeshContext, Vertex, VertexLight,
 };
 use umicraft_model::{
     AtlasLayout, BlockDefinition, BlockModelSet, ModelError, ModelResult, ResourceSource, StateDef,
@@ -589,16 +589,20 @@ fn modelless_water_samples_the_real_fluid_layers() {
         &context,
     );
 
-    assert_eq!(mesh.face_count(), 6);
+    // MCP `BlockFluidRenderer.renderFluid`: a lone still source is its
+    // surface and the surface's underside, its bottom, and four sides drawn
+    // from both sides; the surface and the bottom sample the still texture,
+    // the sides the flowing one.
+    assert_eq!(mesh.face_count(), 11);
     assert_eq!(quads_with(&mesh, [0.0, 1.0, 0.0], still), 1);
-    assert_eq!(quads_with(&mesh, [0.0, -1.0, 0.0], still), 1);
+    assert_eq!(quads_with(&mesh, [0.0, -1.0, 0.0], still), 2);
     for normal in [
         [-1.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
         [0.0, 0.0, -1.0],
         [0.0, 0.0, 1.0],
     ] {
-        assert_eq!(quads_with(&mesh, normal, flow), 1, "{normal:?}");
+        assert_eq!(quads_with(&mesh, normal, flow), 2, "{normal:?}");
     }
 }
 
@@ -641,6 +645,58 @@ fn weighted_variants_are_deterministic_and_vary_by_position() {
         }
     }
     assert_eq!(seen, [true, true], "both weighted variants must be used");
+}
+
+#[test]
+fn without_block_alternatives_every_position_uses_the_heaviest_variant() {
+    let source = Memory::new()
+        .model("variant_a", &CUBE_JSON.replace("#all", "blocks/stone"))
+        .model("variant_b", &CUBE_JSON.replace("#all", "blocks/dirt"))
+        .blockstate(
+            "weighted",
+            r#"{ "variants": { "normal": [
+                { "model": "variant_a", "weight": 1 },
+                { "model": "variant_b", "weight": 3 }
+            ] } }"#,
+        );
+    let context = context(
+        BlockModelSet::build(&source, &[WEIGHTED]).expect("synthetic weighted model set"),
+        &["blocks/dirt", "blocks/stone"],
+    );
+    let dirt_layer = layer(&context, "blocks/dirt");
+    let settings = MeshSettings {
+        lighting: Lighting::Smooth,
+        block_alternatives: false,
+    };
+    for x in 0..16 {
+        for z in 0..16 {
+            let blocks = Single {
+                position: [x, 0, z],
+                state: BlockState::new(4, 0),
+            };
+            let mesh = mesh_chunk_with_settings(ChunkPos::new(0, 0), &blocks, &context, settings);
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .all(|vertex| vertex.layer == dirt_layer),
+                "({x}, {z}) must use the weight 3 variant"
+            );
+        }
+    }
+    // The default settings are the old behaviour.
+    let blocks = Single {
+        position: [3, 0, 5],
+        state: BlockState::new(4, 0),
+    };
+    assert_eq!(
+        mesh_chunk_with_settings(
+            ChunkPos::new(0, 0),
+            &blocks,
+            &context,
+            MeshSettings::default()
+        ),
+        mesh_chunk_with_models(ChunkPos::new(0, 0), &blocks, &context)
+    );
 }
 
 #[test]
@@ -849,19 +905,20 @@ fn the_water_fallback_uses_the_swamp_water_tint() {
         &Scene::new(&water).in_biome(1),
         &context,
     );
-    assert!(!plains.transparent_vertices.is_empty());
-    assert!(plains
-        .transparent_vertices
-        .iter()
-        .all(|vertex| vertex.tint == WHITE));
+    // The surface carries the biome colour as is; the other faces are
+    // darkened by the reference's per-face factor.
+    let surface_tint = |mesh: &umicraft_mesh::Mesh| {
+        mesh.transparent_vertices
+            .iter()
+            .find(|vertex| vertex.normal == [0.0, 1.0, 0.0])
+            .map(|vertex| vertex.tint)
+    };
+    assert_eq!(surface_tint(&plains), Some(WHITE));
 
     let swamp = mesh_chunk_with_models(
         ChunkPos::new(0, 0),
         &Scene::new(&water).in_biome(6),
         &context,
     );
-    assert!(swamp
-        .transparent_vertices
-        .iter()
-        .all(|vertex| vertex.tint == 0xE0_FF_AE));
+    assert_eq!(surface_tint(&swamp), Some(0xE0_FF_AE));
 }

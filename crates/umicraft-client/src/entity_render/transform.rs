@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Where and how a model stands in the world: its orientation, the death
+//! fall, the bed, the player scale and the crouch, and the per-mob touches of
+//! the `Render*` classes (a bat's bob, a golem's roll, a curing zombie's
+//! shake, a screaming enderman's jitter, a tamed cat's size).
+
+use std::f32::consts::PI;
+
+use glam::{Mat4, Vec3};
+use umicraft_core::java_random::JavaRandom;
+use umicraft_game::entity::meta::Variant;
+use umicraft_game::entity::{EntityKind, EntityRenderSnapshot};
+use umicraft_model::entity::triangle_wave;
+
+/// Scale of the player model (MCP `RenderPlayer.preRenderCallback`).
+const PLAYER_SCALE: f32 = 0.9375;
+/// How far a crouching player sinks, in blocks
+/// (MCP `ModelBiped.render`: `translate(0, 0.2, 0)` in the flipped frame).
+const SNEAK_SINK: f32 = 0.2;
+/// The further drop of a crouching player that is not the local one
+/// (`RenderPlayer.doRender`: `y - 0.125`).
+const REMOTE_SNEAK_SINK: f32 = 0.125;
+/// Death fall in degrees at the end of the fall (MCP `getDeathMaxRotation`).
+const DEATH_FALL_DEGREES: f32 = 90.0;
+/// Ticks of the death fall that the angle is spread over, and the speed-up
+/// of its square root (MCP `RendererLivingEntity.rotateCorpse`).
+const DEATH_FALL_TICKS: f32 = 20.0;
+const DEATH_FALL_SPEED: f32 = 1.6;
+/// Scale of a tamed ocelot (MCP `RenderOcelot.preRenderCallback`).
+const TAMED_CAT_SCALE: f32 = 0.8;
+/// How far a flying bat bobs up and down, in blocks (`RenderBat.rotateCorpse`).
+const BAT_BOB: f32 = 0.1;
+/// The widest walking roll of an iron golem, in degrees
+/// (`RenderIronGolem.rotateCorpse`).
+const GOLEM_ROLL_DEGREES: f32 = 6.5;
+/// The deviation of the sideways jitter of a screaming enderman, in blocks
+/// (`RenderEnderman.doRender`).
+const SCREAM_JITTER: f32 = 0.02;
+
+/// The matrix that carries the vertices of a model of `entity` to the world:
+/// [`body_matrix`] and the mirror every vanilla model gets.
+#[must_use]
+pub(crate) fn model_matrix(entity: &EntityRenderSnapshot) -> Mat4 {
+    body_matrix(entity) * x_mirror()
+}
+
+/// `ModelRenderer.postRender(0.0625)` of a part: its pivot and angles, taking a
+/// point of the vanilla frame (y down) of the part to the model space of this
+/// crate (y up). The models of this crate are the vanilla ones with the y axis
+/// flipped, so the chain is conjugated by a y flip.
+#[must_use]
+pub(crate) fn part_frame(part: &umicraft_model::entity::ModelPart) -> Mat4 {
+    part.transform(Mat4::from_scale(Vec3::splat(1.0 / 16.0)))
+        * Mat4::from_scale(Vec3::splat(16.0))
+        * Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+}
+
+/// The vanilla model space is drawn through `scale(-1, -1, 1)`; the models of
+/// this crate undo the y half (y up) but keep the box layout and the UVs of
+/// the vanilla model space, so they are mirrored along x to be seen as in
+/// vanilla: the right arm on the entity's right, skins not mirrored, and
+/// vanilla turns (head yaw, torso turn) in the vanilla direction.
+#[must_use]
+pub(crate) fn x_mirror() -> Mat4 {
+    Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0))
+}
+
+/// Position, turn, scale and crouch of `entity`, without the model mirror.
+/// Attachments given in the vanilla frame (the held item) hang on it.
+#[must_use]
+pub(crate) fn body_matrix(entity: &EntityRenderSnapshot) -> Mat4 {
+    let is_player = entity.kind == EntityKind::Player;
+    let mut matrix =
+        Mat4::from_translation(entity.position + scream_jitter(entity)) * orientation(entity);
+    if is_tamed_cat(entity) {
+        matrix *= Mat4::from_scale(Vec3::splat(TAMED_CAT_SCALE));
+    }
+    if is_player {
+        matrix *= Mat4::from_scale(Vec3::splat(PLAYER_SCALE));
+        if entity.flags.is_sneaking() {
+            matrix *= Mat4::from_translation(Vec3::new(0.0, -SNEAK_SINK, 0.0));
+            if !entity.local {
+                // `RenderPlayer.doRender`: every crouching player but the local
+                // one is lowered by a further 0.125 (before the scale, as the
+                // reference moves the position it draws at).
+                matrix = Mat4::from_translation(Vec3::new(0.0, -REMOTE_SNEAK_SINK, 0.0)) * matrix;
+            }
+        }
+    }
+    matrix
+}
+
+/// The turn of the body: towards its yaw and tipped over when dead, or flat
+/// in a bed.
+///
+/// Models face -Z, and a Minecraft yaw of zero looks towards +Z, hence the
+/// half turn (MCP `rotateCorpse`: `rotate(180 - yaw)`).
+fn orientation(entity: &EntityRenderSnapshot) -> Mat4 {
+    if let Some(bed) = entity.bed {
+        // MCP `RenderPlayer.rotateCorpse` and `renderLivingAt`.
+        return Mat4::from_translation(bed.render_offset)
+            * Mat4::from_rotation_y(bed.orientation.to_radians())
+            * Mat4::from_rotation_z(90.0_f32.to_radians())
+            * Mat4::from_rotation_y(270.0_f32.to_radians());
+    }
+    if let Some(flight) = entity.flight.filter(|_| entity.kind == EntityKind::Dragon) {
+        // MCP `RenderDragon.rotateCorpse`: the dragon turns by the yaw it had 7
+        // ticks ago and tips by the climb between 10 and 5 ticks ago.
+        let climb = (flight.offsets[5][1] - flight.offsets[10][1]) as f32;
+        return Mat4::from_rotation_y(-(flight.offsets[7][0] as f32).to_radians())
+            * Mat4::from_rotation_x((climb * 10.0).to_radians())
+            * Mat4::from_translation(Vec3::Z);
+    }
+    let yaw = entity.body_yaw + curing_shake(entity);
+    bat_bob(entity)
+        * Mat4::from_rotation_y((180.0 - yaw).to_radians())
+        * death_fall(entity.death_time)
+        * golem_roll(entity)
+}
+
+/// A flying bat bobs with time; a hanging one sits 0.1 lower
+/// (`RenderBat.rotateCorpse`).
+fn bat_bob(entity: &EntityRenderSnapshot) -> Mat4 {
+    let lift = match entity.meta.variant {
+        _ if entity.kind != EntityKind::Bat => return Mat4::IDENTITY,
+        Variant::Bat { hanging: true } => -BAT_BOB,
+        _ => (entity.age * 0.3).cos() * BAT_BOB,
+    };
+    Mat4::from_translation(Vec3::new(0.0, lift, 0.0))
+}
+
+/// A walking iron golem rocks from side to side with its stride
+/// (`RenderIronGolem.rotateCorpse`). The interpolated limb swing of the
+/// snapshot is the reference's `limbSwing - limbSwingAmount * (1 - partial)`.
+fn golem_roll(entity: &EntityRenderSnapshot) -> Mat4 {
+    if entity.kind != EntityKind::IronGolem || entity.limb_swing_amount < 0.01 {
+        return Mat4::IDENTITY;
+    }
+    let roll = GOLEM_ROLL_DEGREES * triangle_wave(entity.limb_swing + 6.0, 13.0);
+    Mat4::from_rotation_z(roll.to_radians())
+}
+
+/// The shake of a zombie villager being cured, added to its body yaw
+/// (`RenderZombie.rotateCorpse`): the reference adds `cos(ticks * 3.25) *
+/// PI * 0.25` to an angle in degrees, so it shivers by under a degree.
+fn curing_shake(entity: &EntityRenderSnapshot) -> f32 {
+    match &entity.meta.variant {
+        Variant::Zombie(zombie) if zombie.converting => {
+            (entity.age.floor() * 3.25).cos() * PI * 0.25
+        }
+        _ => 0.0,
+    }
+}
+
+/// The sideways jitter of a screaming enderman, a gaussian of 0.02 on x and z
+/// drawn anew every frame (`RenderEnderman.doRender`). The draw is seeded by
+/// the entity and the frame time, so it changes every frame without a shared
+/// random source on the render thread.
+fn scream_jitter(entity: &EntityRenderSnapshot) -> Vec3 {
+    let screaming =
+        matches!(&entity.meta.variant, Variant::Enderman(enderman) if enderman.screaming);
+    if !screaming {
+        return Vec3::ZERO;
+    }
+    let seed = (u64::from(entity.id.0 as u32) << 32) | u64::from(entity.age.to_bits());
+    let mut rng = JavaRandom::new(seed);
+    let x = rng.next_gaussian() as f32 * SCREAM_JITTER;
+    let z = rng.next_gaussian() as f32 * SCREAM_JITTER;
+    Vec3::new(x, 0.0, z)
+}
+
+/// Whether `entity` is a tamed ocelot, drawn at 0.8 of its size
+/// (`RenderOcelot.preRenderCallback`).
+fn is_tamed_cat(entity: &EntityRenderSnapshot) -> bool {
+    matches!(&entity.meta.variant, Variant::Ocelot(ocelot) if ocelot.tamed)
+}
+
+/// The roll of a dying entity onto its side: fast at first, then slowing
+/// (`sqrt` of the elapsed fraction), at most [`DEATH_FALL_DEGREES`].
+fn death_fall(death_time: f32) -> Mat4 {
+    if death_time <= 0.0 {
+        return Mat4::IDENTITY;
+    }
+    let fraction = ((death_time - 1.0) / DEATH_FALL_TICKS * DEATH_FALL_SPEED)
+        .max(0.0)
+        .sqrt()
+        .min(1.0);
+    Mat4::from_rotation_z((fraction * DEATH_FALL_DEGREES).to_radians())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use umicraft_game::entity::{EntityFlags, EntityId};
+
+    fn snapshot(kind: EntityKind) -> EntityRenderSnapshot {
+        EntityRenderSnapshot::new(EntityId(1), kind, Vec3::new(10.0, 64.0, 20.0))
+    }
+
+    fn front(entity: &EntityRenderSnapshot) -> Vec3 {
+        model_matrix(entity).transform_vector3(Vec3::NEG_Z)
+    }
+
+    #[test]
+    fn a_model_looks_where_the_yaw_says() {
+        // Yaw 0 looks towards +Z, 90 towards -X (MCP `getLook`).
+        let mut entity = snapshot(EntityKind::Zombie);
+        assert!((front(&entity) - Vec3::Z).length() < 1e-5);
+        entity.body_yaw = 90.0;
+        assert!((front(&entity) - Vec3::NEG_X).length() < 1e-5);
+        entity.body_yaw = 180.0;
+        assert!((front(&entity) - Vec3::NEG_Z).length() < 1e-5);
+    }
+
+    #[test]
+    fn the_right_arm_is_on_the_entitys_right() {
+        // Facing south (yaw 0) the entity's right is west (-X); the model's
+        // right arm sits at x = -5 / 16.
+        let entity = snapshot(EntityKind::Zombie);
+        let arm = model_matrix(&entity).transform_point3(Vec3::new(-5.0 / 16.0, 1.0, 0.0));
+        assert!(arm.x < entity.position.x, "{arm}");
+    }
+
+    #[test]
+    fn a_player_is_a_sixteenth_smaller() {
+        let player = model_matrix(&snapshot(EntityKind::Player));
+        let top = player.transform_point3(Vec3::new(0.0, 1.0, 0.0));
+        assert!((top.y - 64.9375).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_crouching_player_sinks_by_a_fifth_of_a_block() {
+        let mut entity = snapshot(EntityKind::Player);
+        entity.flags = EntityFlags::new(0x02, 0);
+        entity.local = true;
+        let feet = model_matrix(&entity).transform_point3(Vec3::ZERO);
+        assert!((feet.y - (64.0 - 0.2 * 0.9375)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_remote_crouching_player_sinks_an_eighth_of_a_block_further() {
+        let mut entity = snapshot(EntityKind::Player);
+        entity.flags = EntityFlags::new(0x02, 0);
+        let feet = model_matrix(&entity).transform_point3(Vec3::ZERO);
+        assert!((feet.y - (64.0 - 0.2 * 0.9375 - 0.125)).abs() < 1e-5);
+        // Standing, it is not lowered at all.
+        entity.flags = EntityFlags::new(0, 0);
+        let standing = model_matrix(&entity).transform_point3(Vec3::ZERO);
+        assert!((standing.y - 64.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn only_players_crouch() {
+        let mut entity = snapshot(EntityKind::Zombie);
+        entity.flags = EntityFlags::new(0x02, 0);
+        let feet = model_matrix(&entity).transform_point3(Vec3::ZERO);
+        assert_eq!(feet.y, 64.0);
+    }
+
+    #[test]
+    fn a_dying_entity_tips_onto_its_side() {
+        let mut entity = snapshot(EntityKind::Zombie);
+        entity.death_time = 1.0;
+        let head = model_matrix(&entity).transform_point3(Vec3::Y) - entity.position;
+        assert!(
+            (head - Vec3::Y).length() < 1e-5,
+            "upright when the fall starts"
+        );
+        entity.death_time = 21.0;
+        let head = model_matrix(&entity).transform_point3(Vec3::Y) - entity.position;
+        assert!(head.y.abs() < 1e-5, "flat at the end: {head}");
+        assert!((head.length() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_death_fall_never_exceeds_a_quarter_turn() {
+        let mut entity = snapshot(EntityKind::Zombie);
+        entity.death_time = 200.0;
+        let head = model_matrix(&entity).transform_point3(Vec3::Y) - entity.position;
+        assert!(head.y.abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_sleeper_lies_flat_along_the_bed() {
+        let mut entity = snapshot(EntityKind::Player);
+        entity.bed = Some(umicraft_game::entity::BedPose::from_facing(0));
+        let head = model_matrix(&entity).transform_point3(Vec3::Y) - entity.position;
+        assert!(head.y.abs() < 0.1, "head is level with the feet: {head}");
+    }
+
+    /// Where the feet of the model end up.
+    fn feet(entity: &EntityRenderSnapshot) -> Vec3 {
+        model_matrix(entity).transform_point3(Vec3::ZERO)
+    }
+
+    #[test]
+    fn a_flying_bat_bobs_with_time() {
+        let mut bat = snapshot(EntityKind::Bat);
+        let high = feet(&bat);
+        assert!((high.y - 64.1).abs() < 1e-4, "{high}");
+        bat.age = PI / 0.3;
+        let low = feet(&bat);
+        assert!((low.y - 63.9).abs() < 1e-4, "{low}");
+        assert_eq!(feet(&snapshot(EntityKind::Zombie)).y, 64.0);
+        bat.meta.variant = Variant::Bat { hanging: true };
+        assert!(
+            (feet(&bat).y - 63.9).abs() < 1e-4,
+            "a hanging bat sits lower"
+        );
+        bat.age = 0.0;
+        assert!((feet(&bat).y - 63.9).abs() < 1e-4, "and does not bob");
+    }
+
+    #[test]
+    fn a_walking_golem_rocks_sideways() {
+        let mut golem = snapshot(EntityKind::IronGolem);
+        let up = |entity: &EntityRenderSnapshot| model_matrix(entity).transform_vector3(Vec3::Y);
+        assert!(
+            (up(&golem) - Vec3::Y).length() < 1e-6,
+            "a still golem stands straight"
+        );
+        golem.limb_swing_amount = 1.0;
+        let tilt = up(&golem).angle_between(Vec3::Y).to_degrees();
+        // `6.5 * tri(0 + 6, 13)`: 6.5 * (0.5 - 3.25) / 3.25.
+        assert!((tilt - 5.5).abs() < 0.01, "{tilt}");
+    }
+
+    #[test]
+    fn a_curing_zombie_villager_shivers() {
+        let mut zombie = snapshot(EntityKind::Zombie);
+        let calm = front(&zombie);
+        zombie.meta.variant = Variant::Zombie(umicraft_game::entity::meta::ZombieMeta {
+            child: None,
+            villager: true,
+            converting: true,
+        });
+        let turn = front(&zombie).angle_between(calm).to_degrees();
+        assert!((turn - PI * 0.25).abs() < 1e-3, "{turn}");
+    }
+
+    #[test]
+    fn a_screaming_enderman_jitters_a_little() {
+        let mut enderman = snapshot(EntityKind::Enderman);
+        assert_eq!(feet(&enderman), Vec3::new(10.0, 64.0, 20.0));
+        enderman.meta.variant = Variant::Enderman(umicraft_game::entity::meta::EndermanMeta {
+            screaming: true,
+            ..Default::default()
+        });
+        let shaken = feet(&enderman);
+        enderman.age = 0.5;
+        let other = feet(&enderman);
+        assert_ne!(shaken, other, "a new draw every frame");
+        for position in [shaken, other] {
+            let offset = position - Vec3::new(10.0, 64.0, 20.0);
+            assert!(offset.y == 0.0 && offset.length() < 0.2, "{offset}");
+        }
+    }
+
+    #[test]
+    fn a_tamed_cat_is_smaller() {
+        let mut cat = snapshot(EntityKind::Ocelot);
+        let wild = model_matrix(&cat).transform_vector3(Vec3::Y).length();
+        cat.meta.variant = Variant::Ocelot(umicraft_game::entity::meta::OcelotMeta {
+            tamed: true,
+            ..Default::default()
+        });
+        let tamed = model_matrix(&cat).transform_vector3(Vec3::Y).length();
+        assert!((tamed - wild * 0.8).abs() < 1e-6, "{wild} {tamed}");
+    }
+}

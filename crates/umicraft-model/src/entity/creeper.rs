@@ -30,6 +30,24 @@ impl Default for CreeperModel {
 }
 
 impl CreeperModel {
+    /// The shell of a charged creeper: the model inflated by 2 pixels (MCP
+    /// `LayerCreeperCharge`, `new ModelCreeper(2.0F)`).
+    #[must_use]
+    pub fn charged() -> Self {
+        let mut model = Self::new();
+        for part in [
+            &mut model.head,
+            &mut model.body,
+            &mut model.leg1,
+            &mut model.leg2,
+            &mut model.leg3,
+            &mut model.leg4,
+        ] {
+            part.grow(2.0);
+        }
+        model
+    }
+
     /// Creates a creeper model (64×32 texture) following MCP `ModelCreeper.java`.
     #[must_use]
     pub fn new() -> Self {
@@ -97,7 +115,8 @@ impl CreeperModel {
         head_yaw: f32,
         head_pitch: f32,
     ) {
-        self.head.rotation[0] = head_pitch.to_radians();
+        // Flipping y turns the sense of x rotations around (as in `pose.rs`).
+        self.head.rotation[0] = -head_pitch.to_radians();
         self.head.rotation[1] = head_yaw.to_radians();
 
         let leg_angle = (limb_swing * 0.6662).cos() * 1.4 * limb_swing_amount;
@@ -110,7 +129,7 @@ impl CreeperModel {
     /// Emits all vertices.
     #[must_use]
     pub fn emit_mesh(&self) -> Vec<ModelVertex> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(6 * 36);
         let root = Mat4::from_scale(Vec3::splat(1.0 / 16.0));
         self.head.emit(root, &mut out);
         self.body.emit(root, &mut out);

@@ -6,9 +6,15 @@
 //! ([`ModelVertex`], [`ModelBox`], [`ModelPart`]) and the texture-slot
 //! registry ([`TextureSlot`], [`MeshLayer`]) are defined here.
 
+mod armor;
+mod banner;
 mod bat;
 mod blaze;
+mod book;
+mod cape;
+mod chest;
 mod chicken;
+pub mod child;
 mod creeper;
 mod dragon;
 mod enderman;
@@ -19,9 +25,11 @@ mod horse;
 mod humanoid;
 mod iron_golem;
 mod ocelot;
+mod pose;
 mod quadruped;
 mod rabbit;
 mod sheep;
+mod sign;
 mod silverfish;
 mod slime;
 mod snowman;
@@ -31,28 +39,35 @@ mod villager;
 mod wither;
 mod wolf;
 
+pub use armor::ArmorMaterial;
+pub use banner::{banner_sway, BannerModel};
 pub use bat::BatModel;
 pub use blaze::BlazeModel;
+pub use book::{BookModel, BookPose};
+pub use cape::CapeModel;
+pub use chest::{chest_facing_degrees, ChestModel};
 pub use chicken::ChickenModel;
 pub use creeper::CreeperModel;
-pub use dragon::DragonModel;
+pub use dragon::{DragonModel, FlightFrame};
 pub use enderman::EndermanModel;
 pub use endermite::EndermiteModel;
-pub use ghast::GhastModel;
-pub use guardian::GuardianModel;
-pub use horse::HorseModel;
+pub use ghast::{GhastModel, RENDER_SCALE as GHAST_SCALE};
+pub use guardian::{GuardianLook, GuardianModel};
+pub use horse::{HorseLook, HorseModel};
 pub use humanoid::HumanoidModel;
-pub use iron_golem::IronGolemModel;
-pub use ocelot::OcelotModel;
+pub use iron_golem::{triangle_wave, GolemAction, IronGolemModel};
+pub use ocelot::{OcelotModel, OcelotPose};
+pub use pose::{ArmPose, HumanoidPose};
 pub use quadruped::QuadrupedModel;
 pub use rabbit::RabbitModel;
 pub use sheep::SheepModel;
+pub use sign::{sign_text_transform, standing_sign_degrees, wall_sign_degrees, SignModel};
 pub use silverfish::SilverfishModel;
 pub use slime::SlimeModel;
 pub use snowman::SnowmanModel;
 pub use spider::SpiderModel;
 pub use squid::SquidModel;
-pub use villager::VillagerModel;
+pub use villager::{witch_nose_angles, VillagerModel};
 pub use wither::WitherModel;
 pub use wolf::WolfModel;
 
@@ -74,7 +89,7 @@ pub struct ModelVertex {
 }
 
 /// A textured cuboid primitive with 6 faces (from MCP `ModelBox`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ModelBox {
     /// Minimum corner in model coordinates.
     pub origin: [f32; 3],
@@ -142,40 +157,40 @@ impl ModelBox {
         let u = self.uv[0];
         let v = self.uv[1];
 
-        let c000 = transform.transform_point3(Vec3::new(x0, y0, z0)).to_array();
-        let c100 = transform.transform_point3(Vec3::new(x1, y0, z0)).to_array();
-        let c110 = transform.transform_point3(Vec3::new(x1, y1, z0)).to_array();
-        let c010 = transform.transform_point3(Vec3::new(x0, y1, z0)).to_array();
-        let c001 = transform.transform_point3(Vec3::new(x0, y0, z1)).to_array();
-        let c101 = transform.transform_point3(Vec3::new(x1, y0, z1)).to_array();
-        let c111 = transform.transform_point3(Vec3::new(x1, y1, z1)).to_array();
-        let c011 = transform.transform_point3(Vec3::new(x0, y1, z1)).to_array();
+        out.reserve(if h == 0.0 { 6 } else { 36 });
+
+        let col0 = transform.x_axis.truncate();
+        let col1 = transform.y_axis.truncate();
+        let col2 = transform.z_axis.truncate();
+        let col3 = transform.w_axis.truncate();
+
+        let x0_vec = col0 * x0;
+        let x1_vec = col0 * x1;
+        let y0_vec = col1 * y0;
+        let y1_vec = col1 * y1;
+        let z0_vec = col2 * z0 + col3;
+        let z1_vec = col2 * z1 + col3;
+
+        let c000 = (x0_vec + y0_vec + z0_vec).to_array();
+        let c100 = (x1_vec + y0_vec + z0_vec).to_array();
+        let c110 = (x1_vec + y1_vec + z0_vec).to_array();
+        let c010 = (x0_vec + y1_vec + z0_vec).to_array();
+        let c001 = (x0_vec + y0_vec + z1_vec).to_array();
+        let c101 = (x1_vec + y0_vec + z1_vec).to_array();
+        let c111 = (x1_vec + y1_vec + z1_vec).to_array();
+        let c011 = (x0_vec + y1_vec + z1_vec).to_array();
 
         let x_sign = if self.mirror { -1.0 } else { 1.0 };
-        let n_down = transform
-            .transform_vector3(Vec3::new(0.0, -1.0, 0.0))
-            .normalize_or_zero()
-            .to_array();
-        let n_up = transform
-            .transform_vector3(Vec3::new(0.0, 1.0, 0.0))
-            .normalize_or_zero()
-            .to_array();
-        let n_north = transform
-            .transform_vector3(Vec3::new(0.0, 0.0, -1.0))
-            .normalize_or_zero()
-            .to_array();
-        let n_south = transform
-            .transform_vector3(Vec3::new(0.0, 0.0, 1.0))
-            .normalize_or_zero()
-            .to_array();
-        let n_west = transform
-            .transform_vector3(Vec3::new(-x_sign, 0.0, 0.0))
-            .normalize_or_zero()
-            .to_array();
-        let n_east = transform
-            .transform_vector3(Vec3::new(x_sign, 0.0, 0.0))
-            .normalize_or_zero()
-            .to_array();
+        let n_up_v = col1.normalize_or_zero();
+        let n_south_v = col2.normalize_or_zero();
+        let n_east_v = (col0 * x_sign).normalize_or_zero();
+
+        let n_up = n_up_v.to_array();
+        let n_down = (-n_up_v).to_array();
+        let n_south = n_south_v.to_array();
+        let n_north = (-n_south_v).to_array();
+        let n_east = n_east_v.to_array();
+        let n_west = (-n_east_v).to_array();
 
         // For 0-height flat plane boxes (such as ModelDragon wing membranes),
         // only emit the Up (+Y) sheet so top/bottom faces do not Z-fight when cull_mode is None.
@@ -397,6 +412,165 @@ pub fn emit_block_item_cube(half_size: f32, transform: Mat4, out: &mut Vec<Model
     emit_quad(out, [c101, c100, c110, c111], n_east, full_face_uvs);
 }
 
+/// Inline capacity of [`PartBoxes`], covering 99% of entity body parts
+/// (1–4 cuboids per part: inner + outer skin layers, cow horns, wolf/ocelot heads)
+/// without any heap allocation.
+const INLINE_PART_BOXES: usize = 4;
+
+/// Stack-first storage (`SmallVec<[ModelBox; 4]>`) for the cuboids of a [`ModelPart`].
+///
+/// Almost every entity [`ModelPart`] contains between 1 and 4 [`ModelBox`]es.
+/// Storing up to [`INLINE_PART_BOXES`] cuboids inline on the stack eliminates
+/// per-part heap allocations when constructing entity models on every frame,
+/// while transparently spilling to a heap [`Vec`] for rare parts with more
+/// than 4 cuboids (such as the 9-box magma cube body).
+#[derive(Debug, Clone)]
+pub enum PartBoxes {
+    /// Up to [`INLINE_PART_BOXES`] cuboids stored directly on the stack.
+    Inline {
+        /// Fixed-size inline storage buffer.
+        buf: [ModelBox; INLINE_PART_BOXES],
+        /// Number of initialized elements in `buf` (`0..=INLINE_PART_BOXES`).
+        len: u8,
+    },
+    /// Fallback heap vector when more than [`INLINE_PART_BOXES`] cuboids are added.
+    Heap(Vec<ModelBox>),
+}
+
+impl Default for PartBoxes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartBoxes {
+    const PLACEHOLDER: ModelBox = ModelBox::new([0.0; 3], [0.0; 3], [0.0; 2], [0.0; 2], 0.0);
+
+    /// Creates an empty inline cuboid list without heap allocation.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::Inline {
+            buf: [Self::PLACEHOLDER; INLINE_PART_BOXES],
+            len: 0,
+        }
+    }
+
+    /// Returns the number of cuboids in this part.
+    #[must_use]
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len as usize,
+            Self::Heap(v) => v.len(),
+        }
+    }
+
+    /// Returns `true` when this part contains no cuboids.
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Appends a cuboid, staying on the stack up to [`INLINE_PART_BOXES`] elements.
+    #[inline]
+    pub fn push(&mut self, b: ModelBox) {
+        match self {
+            Self::Inline { buf, len } => {
+                let idx = *len as usize;
+                if idx < INLINE_PART_BOXES {
+                    buf[idx] = b;
+                    *len += 1;
+                } else {
+                    let mut v = Vec::with_capacity(INLINE_PART_BOXES * 2);
+                    v.extend_from_slice(buf);
+                    v.push(b);
+                    *self = Self::Heap(v);
+                }
+            }
+            Self::Heap(v) => v.push(b),
+        }
+    }
+
+    /// Removes all cuboids from this part.
+    #[inline]
+    pub fn clear(&mut self) {
+        match self {
+            Self::Inline { len, .. } => *len = 0,
+            Self::Heap(v) => v.clear(),
+        }
+    }
+
+    /// Shortens the cuboid list, keeping the first `new_len` cuboids.
+    #[inline]
+    pub fn truncate(&mut self, new_len: usize) {
+        match self {
+            Self::Inline { len, .. } => {
+                if new_len < *len as usize {
+                    *len = new_len as u8;
+                }
+            }
+            Self::Heap(v) => v.truncate(new_len),
+        }
+    }
+
+    /// Returns the cuboids as a slice.
+    #[must_use]
+    #[inline]
+    pub fn as_slice(&self) -> &[ModelBox] {
+        match self {
+            Self::Inline { buf, len } => &buf[..*len as usize],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    /// Returns the cuboids as a mutable slice.
+    #[must_use]
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [ModelBox] {
+        match self {
+            Self::Inline { buf, len } => &mut buf[..*len as usize],
+            Self::Heap(v) => v.as_mut_slice(),
+        }
+    }
+}
+
+impl std::ops::Deref for PartBoxes {
+    type Target = [ModelBox];
+
+    #[inline]
+    fn deref(&self) -> &[ModelBox] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for PartBoxes {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [ModelBox] {
+        self.as_mut_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a PartBoxes {
+    type Item = &'a ModelBox;
+    type IntoIter = std::slice::Iter<'a, ModelBox>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut PartBoxes {
+    type Item = &'a mut ModelBox;
+    type IntoIter = std::slice::IterMut<'a, ModelBox>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
+    }
+}
+
 /// An articulated body part with pivot and local Euler angles.
 #[derive(Debug, Clone)]
 pub struct ModelPart {
@@ -404,8 +578,8 @@ pub struct ModelPart {
     pub pivot: [f32; 3],
     /// Pitch, yaw, roll in radians.
     pub rotation: [f32; 3],
-    /// Cuboids belonging to this part.
-    pub boxes: Vec<ModelBox>,
+    /// Cuboids belonging to this part (stored inline on the stack up to 4 boxes).
+    pub boxes: PartBoxes,
 }
 
 impl ModelPart {
@@ -415,7 +589,15 @@ impl ModelPart {
         Self {
             pivot,
             rotation: [0.0, 0.0, 0.0],
-            boxes: Vec::new(),
+            boxes: PartBoxes::new(),
+        }
+    }
+
+    /// Inflates every box of this part by `amount` pixels (the `modelSize`
+    /// argument of the vanilla model constructors).
+    pub fn grow(&mut self, amount: f32) {
+        for shape in &mut self.boxes {
+            shape.dilation += amount;
         }
     }
 
@@ -470,6 +652,91 @@ pub enum TextureSlot {
     Cow,
     /// Pig mob texture.
     Pig,
+    /// The saddle drawn over a pig (`pig_saddle.png`).
+    PigSaddle,
+    /// The red mushroom block texture (`mushroom_red.png`), drawn on a mooshroom.
+    MushroomRed,
+    /// The soft black blob drawn under entities (`shadow.png`).
+    Shadow,
+    /// The wither while it is being spawned (`wither_invulnerable.png`).
+    WitherInvulnerable,
+    /// The boat (`boat.png`).
+    Boat,
+    /// The minecart (`minecart.png`).
+    Minecart,
+    /// The chest (`chest/normal.png`), carried by a chest minecart.
+    Chest,
+    /// The trapped chest (`chest/trapped.png`).
+    ChestTrapped,
+    /// The ender chest (`chest/ender.png`).
+    ChestEnder,
+    /// The large chest (`chest/normal_double.png`, 128x64).
+    ChestDouble,
+    /// The large trapped chest (`chest/trapped_double.png`, 128x64).
+    ChestTrappedDouble,
+    /// The sign (`sign.png`).
+    Sign,
+    /// A banner design, composed at run time from `banner_base.png` and the
+    /// pattern masks. The number is the hash of the design
+    /// (`BannerDesign::slot` in the client); the texture is not in the
+    /// static table.
+    Banner(u64),
+    /// The glyphs of the font atlas as black on transparent, for the text of
+    /// signs. Made from the UI font at run time, not read from the jar.
+    SignText,
+    /// The book above an enchanting table (`enchanting_table_book.png`).
+    EnchantingBook,
+    /// The ender crystal (`endercrystal/endercrystal.png`).
+    EnderCrystal,
+    /// The experience orb (`experience_orb.png`).
+    ExperienceOrb,
+    /// The sheet of paintings (`painting/paintings_kristoffer_zetterstrand.png`).
+    Painting,
+    /// The knot of a leash (`lead_knot.png`).
+    LeashKnot,
+    /// A plain white texel, for what is drawn without a texture (lightning).
+    Lightning,
+    /// The particle sheet (`particle/particles.png`), of which the bobber is a cell.
+    Particles,
+    /// A plain black texel: the line of a fishing rod.
+    FishLine,
+    /// The two browns of the rope of a leash.
+    Leash,
+    /// The rays of a dying dragon: white to magenta along a 64 x 1 strip.
+    DragonRay,
+    /// The ray between an ender crystal and the dragon it heals
+    /// (`endercrystal/endercrystal_beam.png`), which scrolls along the ray.
+    DragonBeam,
+    /// The beam of a beacon (`entity/beacon_beam.png`), which scrolls up.
+    BeaconBeam,
+    /// The beam of a guardian (`entity/guardian_beam.png`), which scrolls
+    /// along it and is drawn opaque in the tinted pipeline.
+    GuardianBeam,
+    /// The sky layer of an end portal (`environment/end_sky.png`).
+    EndSky,
+    /// The swirl layers of an end portal (`entity/end_portal.png`).
+    EndPortal,
+    /// The dragon while it dies (`enderdragon/dragon_exploding.png`): the
+    /// dragon texture whose alpha says in which order the body dissolves.
+    DragonExploding,
+    /// The arrow (`arrow.png`), flying or stuck in a body.
+    Arrow,
+    /// The ghast while it charges a fireball (`ghast_shooting.png`).
+    GhastShooting,
+    /// The glowing eyes of a spider (`spider_eyes.png`), added over its body.
+    SpiderEyes,
+    /// The glowing eyes of an enderman (`enderman_eyes.png`).
+    EndermanEyes,
+    /// The glowing eyes of the dragon (`dragon_eyes.png`).
+    DragonEyes,
+    /// The swirl of a charged creeper (`creeper_armor.png`).
+    CreeperCharge,
+    /// The swirl of a wounded wither (`wither_armor.png`).
+    WitherAura,
+    /// The enchantment glint (`enchanted_item_glint.png`).
+    EnchantGlint,
+    /// A strip of flames, `0` for `fire_layer_0` and `1` for `fire_layer_1`.
+    Fire(u8),
     /// Sheep base body texture (`sheep.png`).
     Sheep,
     /// Sheep wool overlay texture (`sheep_fur.png`).
@@ -516,6 +783,8 @@ pub enum TextureSlot {
     Ghast,
     /// Guardian texture.
     Guardian,
+    /// Elder guardian texture.
+    GuardianElder,
     /// Horse texture.
     Horse,
     /// Ocelot texture.
@@ -526,8 +795,118 @@ pub enum TextureSlot {
     Silverfish,
     /// Wither boss texture.
     Wither,
-    /// Dropped item block texture.
-    Item,
+    /// Tamed wolf texture.
+    WolfTame,
+    /// Angry wolf texture.
+    WolfAngry,
+    /// Wolf collar overlay, tinted with the collar dye.
+    WolfCollar,
+    /// Black (tuxedo) ocelot.
+    OcelotBlack,
+    /// Red (tabby) ocelot.
+    OcelotRed,
+    /// Siamese ocelot.
+    OcelotSiamese,
+    /// White rabbit.
+    RabbitWhite,
+    /// Black rabbit.
+    RabbitBlack,
+    /// Gold rabbit.
+    RabbitGold,
+    /// Salt and pepper rabbit.
+    RabbitSalt,
+    /// Black and white rabbit.
+    RabbitWhiteSplotched,
+    /// The rabbit named Toast.
+    RabbitToast,
+    /// The killer bunny.
+    RabbitCaerbannog,
+    /// Plain villager (no profession texture).
+    VillagerPlain,
+    /// Librarian villager.
+    VillagerLibrarian,
+    /// Priest villager.
+    VillagerPriest,
+    /// Smith villager.
+    VillagerSmith,
+    /// Butcher villager.
+    VillagerButcher,
+    /// Wither skeleton.
+    SkeletonWither,
+    /// Donkey.
+    HorseDonkey,
+    /// Mule.
+    HorseMule,
+    /// Zombie horse.
+    HorseZombie,
+    /// Skeleton horse.
+    HorseSkeleton,
+    /// The skin of a player, by the index the texture cache gave it.
+    Skin(u32),
+    /// The cape of a player, by the index the texture cache gave it.
+    Cape(u32),
+    /// A horse coat composed from a base colour and a marking, keyed by the
+    /// metadata variant (`base | marking << 8`).
+    HorseCoat(u16),
+    /// The armour texture of a material; `leggings` picks `layer_2`.
+    Armor {
+        /// The material.
+        material: ArmorMaterial,
+        /// Whether it is the leggings texture (`layer_2`).
+        leggings: bool,
+    },
+    /// The `leather` texture multiplied by a dye colour (`0xRRGGBB`).
+    LeatherArmor {
+        /// Whether it is the leggings texture (`layer_2`).
+        leggings: bool,
+        /// The dye colour.
+        color: u32,
+    },
+    /// The undyed leather overlay texture.
+    LeatherOverlay {
+        /// Whether it is the leggings texture (`layer_2`).
+        leggings: bool,
+    },
+}
+
+impl TextureSlot {
+    /// Whether the texture is added over the frame (the glowing layers) and
+    /// repeats, instead of replacing it.
+    #[must_use]
+    pub const fn is_additive(self) -> bool {
+        matches!(
+            self,
+            Self::SpiderEyes
+                | Self::EndermanEyes
+                | Self::DragonEyes
+                | Self::CreeperCharge
+                | Self::WitherAura
+                | Self::EnchantGlint
+                | Self::Lightning
+                | Self::DragonRay
+                | Self::DragonBeam
+                | Self::BeaconBeam
+                | Self::EndSky
+                | Self::EndPortal
+        )
+    }
+
+    /// Whether the texture repeats past its edge: the glowing layers and the
+    /// guardian beam, whose coordinates scroll (`GL_REPEAT`).
+    #[must_use]
+    pub const fn repeats(self) -> bool {
+        self.is_additive() || matches!(self, Self::GuardianBeam)
+    }
+
+    /// Whether this is an armour texture, which stays visible on an invisible
+    /// entity.
+    #[must_use]
+    pub const fn is_armor(self) -> bool {
+        matches!(
+            self,
+            Self::Armor { .. } | Self::LeatherArmor { .. } | Self::LeatherOverlay { .. }
+        )
+    }
 }
 
 /// A mesh layer tagged with its texture slot.
@@ -575,6 +954,68 @@ mod tests {
         let model = ChickenModel::new();
         let mesh = model.emit_mesh();
         assert_eq!(mesh.len(), 288);
+    }
+
+    #[test]
+    fn the_cow_udder_hangs_under_the_belly_towards_the_rear() {
+        // Regression: the udder was drawn on the back of the cow.
+        let cow = QuadrupedModel::cow();
+        let transform = cow
+            .body
+            .transform(Mat4::from_scale(Vec3::splat(1.0 / 16.0)));
+        let bounds = |shape: &ModelBox| {
+            let mut mesh = Vec::new();
+            shape.emit_triangles(transform, &mut mesh);
+            let axis = |i: usize| {
+                let values = mesh.iter().map(|v| v.position[i]);
+                (
+                    values.clone().fold(f32::INFINITY, f32::min),
+                    values.fold(f32::NEG_INFINITY, f32::max),
+                )
+            };
+            (axis(1), axis(2))
+        };
+        let ((body_bottom, body_top), (body_front, body_rear)) = bounds(&cow.body.boxes[0]);
+        let ((udder_bottom, udder_top), (udder_front, udder_rear)) = bounds(&cow.body.boxes[1]);
+        assert!(
+            (udder_top - body_bottom).abs() < 1e-4,
+            "{udder_top} {body_bottom}"
+        );
+        assert!(udder_bottom < body_bottom && udder_top < body_top);
+        // MCP: the body spans z -8..10 and the udder z 4..10, in pixels.
+        assert!((body_front + 0.5).abs() < 1e-4 && (body_rear - 10.0 / 16.0).abs() < 1e-4);
+        assert!((udder_front - 0.25).abs() < 1e-4 && (udder_rear - 10.0 / 16.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pig_and_sheep_bodies_span_the_mcp_extents() {
+        // Regression: the bodies kept the MCP boxes in a y-up frame, which
+        // swapped their front and rear faces.
+        let extents = |body: &ModelPart| {
+            let mut mesh = Vec::new();
+            body.emit(Mat4::from_scale(Vec3::splat(1.0 / 16.0)), &mut mesh);
+            let axis = |i: usize| {
+                let values = mesh.iter().map(|v| v.position[i] * 16.0);
+                (
+                    values.clone().fold(f32::INFINITY, f32::min),
+                    values.fold(f32::NEG_INFINITY, f32::max),
+                )
+            };
+            (axis(1), axis(2))
+        };
+        let close =
+            |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3;
+        // MCP y 5 + (-7..1) and z 2 + (-10..6), mirrored to y up.
+        let (y, z) = extents(&QuadrupedModel::pig().body);
+        assert!(
+            close(y, (6.0, 14.0)) && close(z, (-8.0, 8.0)),
+            "{y:?} {z:?}"
+        );
+        let (y, z) = extents(&SheepModel::new().body);
+        assert!(
+            close(y, (12.0, 18.0)) && close(z, (-8.0, 8.0)),
+            "{y:?} {z:?}"
+        );
     }
 
     #[test]
@@ -678,5 +1119,60 @@ mod tests {
         assert!(!RabbitModel::new().emit_mesh().is_empty());
         assert!(!SilverfishModel::new().emit_mesh().is_empty());
         assert!(!WitherModel::new().emit_mesh().is_empty());
+    }
+
+    #[test]
+    fn every_mob_tilts_its_head_down_when_it_looks_down() {
+        // Regression: several models kept the MCP sign of the head pitch,
+        // but flipping y turns x rotations around (`pose.rs` negates them
+        // for the biped), so a pig, cow, sheep, chicken, creeper or snowman
+        // looking down raised its head.
+        macro_rules! pitch_of {
+            ($model:expr) => {{
+                let mut model = $model;
+                model.set_angles(0.0, 0.0, 0.0, 30.0);
+                model.head.rotation[0]
+            }};
+        }
+        let mut snowman = SnowmanModel::new();
+        snowman.set_angles(0.0, 30.0);
+        let pitches = [
+            ("cow", pitch_of!(QuadrupedModel::cow())),
+            ("pig", pitch_of!(QuadrupedModel::pig())),
+            ("sheep", pitch_of!(SheepModel::new())),
+            ("chicken", pitch_of!(ChickenModel::new())),
+            ("creeper", pitch_of!(CreeperModel::new())),
+            ("snowman", snowman.head.rotation[0]),
+            ("villager", pitch_of!(VillagerModel::villager())),
+            ("wolf", pitch_of!(WolfModel::new())),
+            ("spider", pitch_of!(SpiderModel::new())),
+            ("enderman", {
+                let mut enderman = EndermanModel::new();
+                enderman.set_pose(&HumanoidPose {
+                    head_pitch: 30.0,
+                    ..HumanoidPose::default()
+                });
+                enderman.head.rotation[0]
+            }),
+            ("iron golem", pitch_of!(IronGolemModel::new())),
+            ("ocelot", pitch_of!(OcelotModel::new())),
+        ];
+        for (name, pitch) in pitches {
+            assert!(
+                (pitch + 30.0_f32.to_radians()).abs() < 1e-5,
+                "{name}: {pitch}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sheep_steps_like_the_other_quadrupeds() {
+        // Regression: the sheep legs swung opposite to the pig and cow.
+        let mut sheep = SheepModel::new();
+        sheep.set_angles(1.0, 1.0, 0.0, 0.0);
+        let mut cow = QuadrupedModel::cow();
+        cow.set_angles(1.0, 1.0, 0.0, 0.0);
+        assert!((sheep.leg1.rotation[0] - cow.leg1.rotation[0]).abs() < 1e-6);
+        assert!((sheep.leg2.rotation[0] - cow.leg2.rotation[0]).abs() < 1e-6);
     }
 }

@@ -60,43 +60,56 @@
 //! # }
 //! ```
 
+pub mod animation;
 pub mod atlas;
 pub mod cache;
 pub mod client_jar;
+pub mod client_pack;
 pub mod client_resources;
 pub mod colormap;
+pub mod dial;
 pub mod error;
+pub mod gui_atlas;
 pub mod hash;
 pub mod http;
 pub mod install;
+pub mod languages;
 pub mod manifest;
 pub mod objects;
+pub mod pack_discovery;
+pub mod panorama;
+pub mod profile_textures;
 pub mod progress;
 pub mod resource_pack;
+pub mod server_pack;
 pub mod setup;
 pub mod skin;
+pub mod sound_assets;
 
 mod zip;
 
-pub use atlas::BlockAtlas;
-pub use client_resources::ClientResources;
+pub use animation::TextureAnimation;
+pub use atlas::{BlockAtlas, HiresLayer};
+pub use client_resources::{ClientResources, GlintTexture, ACHIEVEMENT_TILES};
 pub use colormap::{BiomeColormaps, Colormap};
+pub use dial::{DialKind, DialSprite};
 pub use error::{AssetsError, AssetsResult};
+pub use gui_atlas::{DynamicImage, GuiAtlas, GuiRegion, DYNAMIC_PREFIX};
 pub use progress::{Progress, ProgressSnapshot};
 pub use resource_pack::{PackMetadata, ResourcePack, ResourceStack};
 pub use setup::{find_existing_jar, run_setup, SetupStep, TARGET_VERSION};
 pub use skin::{
-    convert_64x32_to_64x64, decode_png_bytes, fetch_mojang_skin, procedural_bat_texture,
-    procedural_blaze_texture, procedural_cave_spider_texture, procedural_chicken_texture,
-    procedural_cow_texture, procedural_creeper_texture, procedural_dragon_texture,
-    procedural_enderman_texture, procedural_endermite_texture, procedural_fallback_skin,
-    procedural_ghast_texture, procedural_guardian_texture, procedural_horse_texture,
-    procedural_iron_golem_texture, procedural_magma_cube_texture, procedural_mooshroom_texture,
-    procedural_ocelot_texture, procedural_pig_texture, procedural_rabbit_texture,
-    procedural_sheep_fur_texture, procedural_sheep_texture, procedural_silverfish_texture,
-    procedural_skeleton_texture, procedural_slime_texture, procedural_snowman_texture,
-    procedural_spider_texture, procedural_squid_texture, procedural_villager_texture,
-    procedural_witch_texture, procedural_wither_texture, procedural_wolf_texture,
-    procedural_zombie_pigman_texture, procedural_zombie_skin, procedural_zombie_villager_texture,
-    ResolvedSkin, SkinModel,
+    convert_64x32_to_64x64, decode_png_bytes, procedural_bat_texture, procedural_blaze_texture,
+    procedural_cave_spider_texture, procedural_chicken_texture, procedural_cow_texture,
+    procedural_creeper_texture, procedural_dragon_texture, procedural_enderman_texture,
+    procedural_endermite_texture, procedural_fallback_skin, procedural_ghast_texture,
+    procedural_guardian_texture, procedural_horse_texture, procedural_iron_golem_texture,
+    procedural_magma_cube_texture, procedural_mooshroom_texture, procedural_ocelot_texture,
+    procedural_pig_texture, procedural_rabbit_texture, procedural_sheep_fur_texture,
+    procedural_sheep_texture, procedural_silverfish_texture, procedural_skeleton_texture,
+    procedural_slime_texture, procedural_snowman_texture, procedural_spider_texture,
+    procedural_squid_texture, procedural_villager_texture, procedural_witch_texture,
+    procedural_wither_texture, procedural_wolf_texture, procedural_zombie_pigman_texture,
+    procedural_zombie_skin, procedural_zombie_villager_texture, SkinModel,
 };
+pub use sound_assets::SoundAssets;

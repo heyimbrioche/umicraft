@@ -8,11 +8,13 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # cpal links ALSA on Linux (see docs/decisions/0050-p11-audio.md).
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -27,7 +29,7 @@ jobs:
     name: no Mojang assets in the repository
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Fail if a Mojang asset is committed
         shell: bash
         run: |
@@ -42,6 +44,16 @@ jobs:
           # reviewed on every pull request.
           allowed=(
             # "crates/umicraft-render/assets/fallback.png CC0-1.0, Umicraft contributors"
+            "crates/umicraft-audio/tests/fixtures/tone_440hz_mono.ogg CC0-1.0, Umicraft contributors"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/logo.png MIT OR Apache-2.0, Umicraft project owner"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/panorama/panorama_0.png owner waiver ADR-0056, TheLake"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/panorama/panorama_1.png owner waiver ADR-0056, TheLake"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/panorama/panorama_2.png owner waiver ADR-0056, TheLake"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/panorama/panorama_3.png owner waiver ADR-0056, TheLake"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/panorama/panorama_4.png owner waiver ADR-0056, TheLake"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/panorama/panorama_5.png owner waiver ADR-0056, TheLake"
+            "crates/umicraft-assets/client-pack/umicraft/font/Inter-SemiBold.ttf OFL-1.1, The Inter Project Authors"
+            "crates/umicraft-assets/client-pack/umicraft/textures/ui/settings.png MIT OR Apache-2.0, Umicraft contributors"
           )
 
           is_allowed() {

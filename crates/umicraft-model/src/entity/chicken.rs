@@ -6,6 +6,7 @@ use std::f32::consts::PI;
 
 use glam::{Mat4, Vec3};
 
+use super::child::{emit_child, ChildLayout};
 use super::{ModelBox, ModelPart, ModelVertex};
 
 /// 1.8 Chicken model following MCP `ModelChicken.java`.
@@ -118,7 +119,7 @@ impl ChickenModel {
         }
     }
 
-    /// Sets animation angles for walking and head look.
+    /// Sets the head look (degrees) and the walking legs.
     pub fn set_angles(
         &mut self,
         limb_swing: f32,
@@ -126,7 +127,8 @@ impl ChickenModel {
         head_yaw: f32,
         head_pitch: f32,
     ) {
-        let pitch_rad = head_pitch.to_radians();
+        // Flipping y turns the sense of x rotations around (as in `pose.rs`).
+        let pitch_rad = -head_pitch.to_radians();
         let yaw_rad = head_yaw.to_radians();
 
         self.head.rotation[0] = pitch_rad;
@@ -139,17 +141,38 @@ impl ChickenModel {
         let leg_angle = (limb_swing * 0.6662).cos() * 1.4 * limb_swing_amount;
         self.right_leg.rotation[0] = -leg_angle;
         self.left_leg.rotation[0] = leg_angle;
+    }
 
-        // Flapping wings
-        let wing_angle = (limb_swing * 0.6662).cos() * 0.4 * limb_swing_amount;
-        self.right_wing.rotation[2] = wing_angle;
-        self.left_wing.rotation[2] = -wing_angle;
+    /// Spreads the wings by `flap`, the value of
+    /// `RenderChicken.handleRotationFloat` (`(sin(wingRotation) + 1) *
+    /// destPos`): folded on the ground, beating in the air (MCP
+    /// `ModelChicken.setRotationAngles`; the z roll is negated for the
+    /// flipped y).
+    pub fn set_wings(&mut self, flap: f32) {
+        self.right_wing.rotation[2] = -flap;
+        self.left_wing.rotation[2] = flap;
+    }
+
+    /// Emits a chick: the head at full size, the rest halved.
+    #[must_use]
+    pub fn emit_child_mesh(&self) -> Vec<ModelVertex> {
+        emit_child(
+            &[&self.head, &self.bill, &self.chin],
+            &[
+                &self.body,
+                &self.right_leg,
+                &self.left_leg,
+                &self.right_wing,
+                &self.left_wing,
+            ],
+            ChildLayout::SMALL_ANIMAL,
+        )
     }
 
     /// Emits all vertices.
     #[must_use]
     pub fn emit_mesh(&self) -> Vec<ModelVertex> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(8 * 36);
         let root = Mat4::from_scale(Vec3::splat(1.0 / 16.0));
         self.head.emit(root, &mut out);
         self.bill.emit(root, &mut out);
@@ -160,5 +183,21 @@ impl ChickenModel {
         self.right_wing.emit(root, &mut out);
         self.left_wing.emit(root, &mut out);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wings_follow_the_flap_not_the_stride() {
+        // Regression: the wings swung with the legs and never beat in the air.
+        let mut chicken = ChickenModel::new();
+        chicken.set_angles(1.0, 1.0, 0.0, 0.0);
+        assert_eq!(chicken.right_wing.rotation[2], 0.0);
+        chicken.set_wings(1.5);
+        assert_eq!(chicken.right_wing.rotation[2], -1.5);
+        assert_eq!(chicken.left_wing.rotation[2], 1.5);
     }
 }

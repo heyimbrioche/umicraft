@@ -5,8 +5,11 @@
 //! into a `.umcapt` file (spec M1: packet logger tool + capture/replay work).
 //!
 //! ```text
-//! umicraft-packet-logger <listen_addr> <upstream_addr> [--out FILE]
+//! umicraft-packet-logger <listen_addr> <upstream_addr> [--out FILE] [--connections N]
 //! ```
+//!
+//! `--connections N` stops and saves once N connections have closed, so an
+//! unattended run (a scripted client, no Ctrl+C) still writes its capture.
 //!
 //! Frames are split by the wire `[packet len][bytes]` rule *without* looking
 //! inside them, so logging works on compressed or encrypted streams alike.
@@ -19,17 +22,20 @@ use tokio::net::{TcpListener, TcpStream};
 use umicraft_testkit::capture::{take_raw_frame, Capture, Direction};
 
 const USAGE: &str =
-    "usage: umicraft-packet-logger <listen_addr> <upstream_addr> [--out FILE.umcapt]";
+    "usage: umicraft-packet-logger <listen_addr> <upstream_addr> [--out FILE.umcapt] [--connections N]";
 
 struct Args {
     listen: String,
     upstream: String,
     out: PathBuf,
+    /// Stop after this many closed connections (`None`: run until Ctrl+C).
+    connections: Option<usize>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut positional = Vec::new();
     let mut out = PathBuf::from("umicraft-capture.umcapt");
+    let mut connections = None;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
@@ -39,6 +45,17 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                     .get(index + 1)
                     .ok_or("missing value after --out")?
                     .into();
+                index += 2;
+            }
+            "--connections" => {
+                let value = argv.get(index + 1).ok_or("missing value after --connections")?;
+                connections = Some(
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|count| *count > 0)
+                        .ok_or("--connections must be a positive number")?,
+                );
                 index += 2;
             }
             other => {
@@ -52,6 +69,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             listen: positional[0].clone(),
             upstream: positional[1].clone(),
             out,
+            connections,
         }),
         _ => Err(format!("need exactly two addresses\n{USAGE}")),
     }
@@ -107,6 +125,17 @@ fn ms_now() -> u64 {
         .map_or(0, |span| span.as_millis() as u64)
 }
 
+/// Writes the capture to `path` and returns how many frames it holds.
+///
+/// The lock is taken once: the logger used to lock the mutex again while the
+/// guard of the first lock was still alive (a temporary of the `match`
+/// scrutinee), so it saved the file and then hung on `Ctrl+C`.
+fn save_capture(capture: &Mutex<Capture>, path: &std::path::Path) -> std::io::Result<usize> {
+    let capture = capture.lock().expect("capture mutex is not poisoned");
+    capture.save(path)?;
+    Ok(capture.entries.len())
+}
+
 /// Binds, forwards, and records; ends on socket close or `Ctrl+C`.
 async fn run(args: &Args, capture: Arc<Mutex<Capture>>) -> std::io::Result<()> {
     let listener = TcpListener::bind(&args.listen).await?;
@@ -115,26 +144,48 @@ async fn run(args: &Args, capture: Arc<Mutex<Capture>>) -> std::io::Result<()> {
         listen = args.listen,
         upstream = args.upstream
     );
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut closed = 0usize;
     loop {
-        let (client_stream, _peer) = listener.accept().await?;
+        if let Some(limit) = args.connections {
+            if closed >= limit {
+                return Ok(());
+            }
+        }
+        let (client_stream, _peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            Some(_) = sessions.join_next() => {
+                closed += 1;
+                continue;
+            }
+        };
         let Ok(server_stream) = TcpStream::connect(&args.upstream).await else {
             println!("upstream {} unreachable, closing", args.upstream);
             continue;
         };
+        // Both legs without Nagle, so the proxy does not move packets in time.
+        if client_stream.set_nodelay(true).is_err() || server_stream.set_nodelay(true).is_err() {
+            println!("could not set TCP_NODELAY, closing");
+            continue;
+        }
         let (client_read, client_write) = client_stream.into_split();
         let (server_read, server_write) = server_stream.into_split();
-        tokio::spawn(pump(
+        // One session ends when either direction ends.
+        let upstream = pump(
             client_read,
             server_write,
             Arc::clone(&capture),
             Direction::ClientToServer,
-        ));
-        tokio::spawn(pump(
+        );
+        let downstream = pump(
             server_read,
             client_write,
             Arc::clone(&capture),
             Direction::ServerToClient,
-        ));
+        );
+        sessions.spawn(async move {
+            tokio::join!(upstream, downstream);
+        });
     }
 }
 
@@ -162,20 +213,8 @@ fn main() {
         }
     });
 
-    match &capture
-        .lock()
-        .expect("capture mutex is not poisoned")
-        .save(&args.out)
-    {
-        Ok(()) => println!(
-            "recorded {} frames -> {}",
-            capture
-                .lock()
-                .expect("capture mutex is not poisoned")
-                .entries
-                .len(),
-            args.out.display()
-        ),
+    match save_capture(&capture, &args.out) {
+        Ok(frames) => println!("recorded {frames} frames -> {}", args.out.display()),
         Err(err) => {
             eprintln!("failed to save capture: {err}");
             std::process::exit(1);
@@ -185,5 +224,43 @@ fn main() {
     if let Err(err) = result {
         eprintln!("proxy stopped: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: saving twice the lock of the capture must be free
+    /// again, and the count is the number of frames.
+    #[test]
+    fn saving_a_capture_returns_its_frame_count_and_releases_the_lock() {
+        let capture = Mutex::new(Capture::default());
+        capture
+            .lock()
+            .expect("not poisoned")
+            .add(Direction::ClientToServer, 1, vec![1, 0]);
+        let dir = std::env::temp_dir().join(format!("umicraft-logger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("test.umcapt");
+        assert_eq!(save_capture(&capture, &path).expect("saved"), 1);
+        assert_eq!(save_capture(&capture, &path).expect("saved again"), 1);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn connections_flag_is_parsed_and_validated() {
+        let ok = parse_args(
+            ["a:1", "b:2", "--connections", "2"].map(String::from).to_vec(),
+        )
+        .expect("valid arguments");
+        assert_eq!(ok.connections, Some(2));
+        assert_eq!(
+            parse_args(["a:1", "b:2"].map(String::from).to_vec())
+                .expect("valid arguments")
+                .connections,
+            None
+        );
+        assert!(parse_args(["a:1", "b:2", "--connections", "0"].map(String::from).to_vec()).is_err());
     }
 }

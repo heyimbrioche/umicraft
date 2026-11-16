@@ -34,18 +34,32 @@
 //! assert!(output.focus.is_none());
 //! ```
 
+pub mod brand_font;
 pub mod context;
 pub mod debug_screen;
 pub mod draw;
+pub mod font_grid;
+pub mod game_menu;
 pub mod geom;
+pub mod icons;
 pub mod id;
 pub mod input;
+pub mod legacy_text;
+pub mod menus;
+pub mod mod_widget;
+pub mod modern;
+pub mod screens;
+pub mod styled_text;
 pub mod text;
 pub mod widgets;
 
 pub use context::{Ui, UiOutput, UiResponse};
-pub use draw::{Color, DrawCommand, DrawList, TextStyle};
+pub use draw::{Color, DrawCommand, DrawList, FontFace, SpriteSheet, TextStyle};
 pub use geom::{Axis, Insets, Layout, Rect, ScrollArea};
 pub use id::WidgetId;
 pub use input::{InputEvent, Key, Modifiers, PointerButton, UiInput};
+pub use screens::{
+    gui_scale, gui_scale_option, set_gui_scale_option, ScaledResolution, ScreenKind, ScreenLayout,
+};
 pub use text::{FontAtlas, FontError, Glyph};
+pub use widgets::{draw_item, SlotItem};

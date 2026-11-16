@@ -48,6 +48,19 @@ impl Section {
         }
     }
 
+    /// Creates an all-air section under open sky: every sky nibble is 15.
+    ///
+    /// A column omits air sections and reads them as full sky, so a section
+    /// materialised later (a block placed in it, light spilling into it) must
+    /// start from the same value or the rest of it would turn black.
+    #[must_use]
+    pub(crate) fn open_sky() -> Self {
+        Self {
+            sky_light: Some(Box::new([0xFF; LIGHT_BYTES])),
+            ..Self::empty()
+        }
+    }
+
     /// Decodes the wire block/light arrays. The caller (`ChunkColumn`) has
     /// already validated the total payload length; this constructor is
     /// tolerant of short inputs (missing bytes read as zero) so it can never
@@ -57,10 +70,13 @@ impl Section {
         block_light: &[u8],
         sky_light: Option<&[u8]>,
     ) -> Self {
-        let mut palette: Vec<BlockState> = Vec::new();
-        let mut lookup: HashMap<u16, u16> = HashMap::new();
+        const INLINE_LOOKUP_CAP: usize = 16;
+        let mut palette: Vec<BlockState> = Vec::with_capacity(INLINE_LOOKUP_CAP);
+        let mut lookup: Option<HashMap<u16, u16>> = None;
         let mut entries = [0u16; BLOCKS_PER_SECTION];
         let mut non_air = 0u16;
+        let mut last_raw = u16::MAX;
+        let mut last_entry = 0u16;
 
         for (slot, pair) in block_bytes
             .chunks_exact(2)
@@ -71,11 +87,33 @@ impl Section {
             if raw != 0 {
                 non_air += 1;
             }
-            let next_index = palette.len() as u16;
-            let entry = *lookup.entry(raw).or_insert_with(|| {
-                palette.push(BlockState::from_wire(raw));
+            if raw == last_raw && !palette.is_empty() {
+                entries[slot] = last_entry;
+                continue;
+            }
+            let state = BlockState::from_wire(raw);
+            let entry = if let Some(map) = &mut lookup {
+                let next_index = palette.len() as u16;
+                *map.entry(raw).or_insert_with(|| {
+                    palette.push(state);
+                    next_index
+                })
+            } else if let Some(idx) = palette.iter().position(|&s| s == state) {
+                idx as u16
+            } else {
+                let next_index = palette.len() as u16;
+                palette.push(state);
+                if palette.len() > INLINE_LOOKUP_CAP {
+                    let mut map = HashMap::with_capacity(32);
+                    for (idx, s) in palette.iter().enumerate() {
+                        map.insert(s.wire(), idx as u16);
+                    }
+                    lookup = Some(map);
+                }
                 next_index
-            });
+            };
+            last_raw = raw;
+            last_entry = entry;
             entries[slot] = entry;
         }
 

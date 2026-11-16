@@ -19,8 +19,9 @@
 
 use umicraft_ui::{InputEvent, Key, Modifiers, PointerButton, UiInput};
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta};
-use winit::keyboard::{KeyCode, ModifiersState};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta};
+use winit::keyboard::{Key as LogicalKey, KeyCode, ModifiersState};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 /// Approximate number of pixels in one wheel line for pixel-precision
 /// touchpads, used to keep the list scrolling at a familiar speed.
@@ -48,7 +49,34 @@ pub fn ui_key(code: KeyCode) -> Option<Key> {
         KeyCode::End => Some(Key::End),
         KeyCode::PageUp => Some(Key::PageUp),
         KeyCode::PageDown => Some(Key::PageDown),
+        KeyCode::F5 => Some(Key::F5),
+        KeyCode::KeyA => Some(Key::A),
+        KeyCode::KeyC => Some(Key::C),
+        KeyCode::KeyV => Some(Key::V),
+        KeyCode::KeyX => Some(Key::X),
+        KeyCode::KeyY => Some(Key::Y),
+        KeyCode::KeyZ => Some(Key::Z),
         _ => None,
+    }
+}
+
+/// The key a Control shortcut means on the user's keyboard layout.
+///
+/// Keys are matched by position (`KeyCode`), but a shortcut such as Control+A
+/// is named by its letter: on an AZERTY keyboard that letter sits where a
+/// QWERTY one has `Q`. When the layout's letter is one of the text shortcuts
+/// (A, C, V, X, Y, Z) its code replaces the physical one; any other key keeps its
+/// position, so movement and bindings are unaffected.
+#[must_use]
+pub fn shortcut_code(event: &KeyEvent, physical: KeyCode) -> KeyCode {
+    match event.key_without_modifiers().as_ref() {
+        LogicalKey::Character("a") => KeyCode::KeyA,
+        LogicalKey::Character("c") => KeyCode::KeyC,
+        LogicalKey::Character("v") => KeyCode::KeyV,
+        LogicalKey::Character("x") => KeyCode::KeyX,
+        LogicalKey::Character("y") => KeyCode::KeyY,
+        LogicalKey::Character("z") => KeyCode::KeyZ,
+        _ => physical,
     }
 }
 
@@ -182,6 +210,18 @@ impl UiInputTranslator {
         if let Some(event) = key_event(code, state) {
             self.events.push(event);
         }
+        // Control+V (Command on macOS) hands the clipboard to the focused text
+        // field; the V itself reaches the UI only as the key.
+        let shortcut = (self.modifiers.control || self.modifiers.meta) && !self.modifiers.alt;
+        if state == ElementState::Pressed
+            && code == KeyCode::KeyV
+            && shortcut
+            && !self.modifiers.shift
+        {
+            if let Some(text) = crate::clipboard::read() {
+                self.events.push(InputEvent::Paste(text));
+            }
+        }
         if state == ElementState::Pressed {
             if let Some(text) = text {
                 self.text(text);
@@ -216,6 +256,28 @@ mod tests {
     use winit::keyboard::ModifiersState;
 
     #[test]
+    fn the_letters_of_the_text_shortcuts_are_mapped() {
+        assert_eq!(ui_key(KeyCode::KeyA), Some(Key::A));
+        assert_eq!(ui_key(KeyCode::KeyC), Some(Key::C));
+        assert_eq!(ui_key(KeyCode::KeyV), Some(Key::V));
+        assert_eq!(ui_key(KeyCode::KeyX), Some(Key::X));
+        assert_eq!(ui_key(KeyCode::KeyY), Some(Key::Y));
+        assert_eq!(ui_key(KeyCode::KeyZ), Some(Key::Z));
+        assert_eq!(ui_key(KeyCode::KeyB), None);
+    }
+
+    #[test]
+    fn a_plain_v_asks_for_no_paste() {
+        let mut translator = UiInputTranslator::new();
+        translator.key(KeyCode::KeyV, ElementState::Pressed, None);
+        assert_eq!(
+            translator.take().events,
+            vec![InputEvent::KeyPressed(Key::V)],
+            "no Control, so the clipboard is not read"
+        );
+    }
+
+    #[test]
     fn key_down_and_up_are_translated() {
         let mut translator = UiInputTranslator::new();
         translator.key(KeyCode::Backspace, ElementState::Pressed, None);
@@ -237,7 +299,11 @@ mod tests {
         translator.key(KeyCode::KeyA, ElementState::Pressed, Some("a"));
         assert_eq!(
             translator.take().events,
-            vec![InputEvent::Text("a".to_string())]
+            // The key comes first (Control+A reads it), then the text.
+            vec![
+                InputEvent::KeyPressed(Key::A),
+                InputEvent::Text("a".to_string())
+            ]
         );
 
         // F2 is the window's toggle, not a UI key, so only text (none here)

@@ -285,6 +285,129 @@ fn a_tall_animation_strip_contributes_only_its_first_frame() {
         .any(|pixel| pixel == [0, 255, 0, 255]));
 }
 
+/// An animation strip with `.mcmeta` animates its layer (water, lava, fire),
+/// and one without metadata stays on its first frame.
+#[test]
+fn a_strip_with_mcmeta_becomes_an_animated_layer() {
+    let dir = TempDir::new("animated-layer");
+    let mut strip = vec![[255, 0, 0, 255]; 4];
+    strip.extend_from_slice(&[[0, 255, 0, 255]; 4]);
+    let strip_png = png_rgba(2, 4, &strip);
+    let meta_path = format!("{}.mcmeta", block_path("water"));
+    let jar = jar_with(
+        &dir,
+        &[
+            (block_path("water").as_str(), &strip_png),
+            (meta_path.as_str(), br#"{"animation": {"frametime": 2}}"#),
+            (block_path("plain").as_str(), &strip_png),
+        ],
+    );
+
+    let resources = ClientResources::load(&jar).expect("the animation loads");
+    let atlas = resources.atlas();
+    let water = atlas.layout().layer("blocks/water").expect("water layer");
+    let mut animations = atlas.animations().to_vec();
+    assert_eq!(animations.len(), 1, "only the strip with metadata animates");
+    assert_eq!(animations[0].layer(), water);
+    // The layer starts on frame 0 and the second frame arrives after 2 ticks.
+    assert_eq!(texel(atlas, water, 0, 0), [255, 0, 0, 255]);
+    assert!(animations[0].tick().is_none());
+    let second = animations[0].tick().expect("the frame changes");
+    assert_eq!(second.len(), 2 * 2 * 4);
+    assert!(second
+        .chunks_exact(4)
+        .all(|pixel| pixel == [0, 255, 0, 255]));
+}
+
+/// Items share the atlas of the blocks, so an animated item of a resource pack
+/// plays its `.mcmeta` like a block does; a strip without metadata, the
+/// compass and the clock are not on a timeline.
+#[test]
+fn an_animated_item_becomes_an_animated_layer() {
+    let dir = TempDir::new("animated-item");
+    let mut strip = vec![[255, 0, 0, 255]; 4];
+    strip.extend_from_slice(&[[0, 255, 0, 255]; 4]);
+    let strip_png = png_rgba(2, 4, &strip);
+    let item = |name: &str| format!("assets/minecraft/textures/items/{name}.png");
+    let sword_meta = format!("{}.mcmeta", item("diamond_sword"));
+    let clock_meta = format!("{}.mcmeta", item("clock"));
+    let jar = jar_with(
+        &dir,
+        &[
+            (item("diamond_sword").as_str(), &strip_png),
+            (
+                sword_meta.as_str(),
+                br#"{"animation": {"frametime": 3, "interpolate": true}}"#,
+            ),
+            (item("stick").as_str(), &strip_png),
+            (item("clock").as_str(), &strip_png),
+            (clock_meta.as_str(), br#"{"animation": {}}"#),
+        ],
+    );
+
+    let resources = ClientResources::load(&jar).expect("the animated item loads");
+    let atlas = resources.atlas();
+    let sword = atlas
+        .layout()
+        .layer("items/diamond_sword")
+        .expect("sword layer");
+    let animations = atlas.animations();
+    assert_eq!(animations.len(), 1, "only the item with metadata animates");
+    assert_eq!(animations[0].layer(), sword);
+    assert_eq!(texel(atlas, sword, 0, 0), [255, 0, 0, 255]);
+    // The strip without metadata stays on its first frame.
+    let stick = atlas.layout().layer("items/stick").expect("stick layer");
+    assert_eq!(texel(atlas, stick, 0, 0), [255, 0, 0, 255]);
+    // The clock keeps its dial, whatever its metadata says.
+    assert_eq!(atlas.dials().len(), 1);
+}
+
+/// The compass and the clock keep every frame of their strip for the game
+/// state to choose from; the layer starts on the first one and no timeline
+/// animation is created for them.
+#[test]
+fn the_compass_and_the_clock_become_dial_sprites() {
+    let dir = TempDir::new("dials");
+    let mut strip = vec![[255, 0, 0, 255]; 4];
+    strip.extend_from_slice(&[[0, 255, 0, 255]; 4]);
+    let strip_png = png_rgba(2, 4, &strip);
+    let item = |name: &str| format!("assets/minecraft/textures/items/{name}.png");
+    let compass_meta = format!("{}.mcmeta", item("compass"));
+    let jar = jar_with(
+        &dir,
+        &[
+            (item("compass").as_str(), &strip_png),
+            (compass_meta.as_str(), br#"{"animation": {}}"#),
+            (item("clock").as_str(), &strip_png),
+            (
+                item("apple").as_str(),
+                &png_rgba(2, 2, &[[1, 2, 3, 255]; 4]),
+            ),
+        ],
+    );
+
+    let resources = ClientResources::load(&jar).expect("the dials load");
+    let atlas = resources.atlas();
+    assert!(atlas.animations().is_empty());
+    let dials = atlas.dials();
+    assert_eq!(dials.len(), 2);
+    let compass = dials
+        .iter()
+        .find(|dial| dial.kind() == umicraft_assets::DialKind::Compass)
+        .expect("compass");
+    assert_eq!(
+        compass.layer(),
+        atlas.layout().layer("items/compass").unwrap()
+    );
+    assert_eq!(compass.frame_count(), 2);
+    assert_eq!(texel(atlas, compass.layer(), 0, 0), [255, 0, 0, 255]);
+    assert!(compass
+        .frame(1)
+        .unwrap()
+        .chunks_exact(4)
+        .all(|pixel| pixel == [0, 255, 0, 255]));
+}
+
 #[test]
 fn the_missing_layer_is_opaque_checker_like_and_not_empty() {
     let dir = TempDir::new("missing");
@@ -579,6 +702,34 @@ fn official_1_8_8_counts() {
         .iter()
         .filter(|path| path.ends_with(".mcmeta"))
         .count();
+
+    // Water, lava, fire and portal animate (the live-game regression: they
+    // showed a frozen first frame).
+    let animated: Vec<_> = resources
+        .atlas()
+        .animations()
+        .iter()
+        .filter_map(|animation| {
+            resources
+                .atlas()
+                .layout()
+                .keys()
+                .get(animation.layer() as usize)
+        })
+        .collect();
+    println!("animated layers   : {animated:?}");
+    for key in [
+        "blocks/water_still",
+        "blocks/water_flow",
+        "blocks/lava_still",
+        "blocks/lava_flow",
+    ] {
+        assert!(animated.iter().any(|animated| *animated == key), "{key}");
+    }
+    assert!(
+        animated.iter().all(|key| key.starts_with("blocks/")),
+        "the clock and the compass are not timeline-driven"
+    );
 
     println!(
         "blockstates       : {blockstates}\n\

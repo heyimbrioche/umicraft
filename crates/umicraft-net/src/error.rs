@@ -11,6 +11,14 @@ pub enum NetError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The host name did not resolve to any address (vanilla
+    /// `UnknownHostException`, shown as "Unknown host").
+    #[error("unknown host `{host}`")]
+    UnknownHost {
+        /// The name that was looked up.
+        host: String,
+    },
+
     /// Protocol-level failure (framing, decode, crypto helpers).
     #[error(transparent)]
     Protocol(#[from] umicraft_protocol::ProtocolError),
@@ -37,6 +45,10 @@ pub enum NetError {
         /// Verify token to echo back encrypted.
         verify_token: Vec<u8>,
     },
+
+    /// The session server refused the join (bad or expired token).
+    #[error("session authentication failed: {0}")]
+    Auth(#[from] umicraft_auth::AuthError),
 
     /// The server sent a login-state `Disconnect`.
     #[error("kicked during login: {reason}")]

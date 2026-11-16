@@ -8,9 +8,18 @@ use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
 use umicraft_client::args::{Args, Mode, USAGE};
-use umicraft_client::{block_demo, entity_demo, headless, screenshot, setup_cli, ui_demo, window};
+use umicraft_client::{
+    audio_bridge, bench_scene, block_demo, entity_demo, headless, hud_demo, launch_session,
+    screenshot, setup_cli, ui_demo, window,
+};
+
+#[global_allocator]
+static ALLOCATOR: umicraft_core::profiling::CountingAllocator =
+    umicraft_core::profiling::CountingAllocator::new();
 
 fn main() -> ExitCode {
+    umicraft_core::boot_log::init();
+    umicraft_core::boot_log!("main_started");
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -22,7 +31,9 @@ fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let args = match Args::parse(&words) {
+    let parsed = launch_session::split(&words)
+        .and_then(|(rest, session)| Args::parse(&rest).map(|args| Args { session, ..args }));
+    let args = match parsed {
         Ok(args) => args,
         Err(message) => {
             eprintln!("{message}");
@@ -30,12 +41,22 @@ fn main() -> ExitCode {
         }
     };
 
+    if args.profile {
+        umicraft_core::profiling::set_enabled(true);
+    }
+
+    // Kept alive for the whole run: dropping it stops the puffin stream.
+    let _profiler = umicraft_core::profiling::serve();
+
     let result = match args.mode() {
         Mode::SetupAssets => setup_cli::run(),
+        Mode::AudioProbe => audio_bridge::probe::run(),
         Mode::UiDemo => ui_demo::run(&args),
+        Mode::HudDemo => hud_demo::run(&args),
         Mode::BlockDemo => block_demo::run(&args),
         Mode::EntityDemo => entity_demo::run(&args),
         Mode::Headless => headless::run(&args),
+        Mode::BenchScene => bench_scene::run(&args),
         Mode::Screenshot => screenshot::run(&args),
         Mode::Windowed => window::run(args.clone()),
     };
